@@ -1,0 +1,39 @@
+# Environment & Credentials
+.env
+*.env
+.env.*
+!.env.example
+
+# Local Household & Private Configs
+config/household.yaml
+!config/household.example.yaml
+config/pantry_staples.json
+!config/pantry_staples.example.json
+
+# Local Cache & State
+cache/
+data/
+*.session
+cookies.txt
+*.cookies.txt
+
+# Python & Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS & System Artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
