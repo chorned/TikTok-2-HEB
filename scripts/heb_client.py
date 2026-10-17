@@ -19,6 +19,15 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("heb_client")
 
+# Automatically load project .env if present
+try:
+    from dotenv import load_dotenv
+    _env_file = Path(__file__).resolve().parent.parent / ".env"
+    if _env_file.is_file():
+        load_dotenv(_env_file)
+except ImportError:
+    pass
+
 # Default brand hierarchy
 DEFAULT_BRAND_HIERARCHY = [
     "H-E-B",
@@ -175,6 +184,119 @@ class HEBClient:
             browser.close()
 
         return results
+
+    def warm_up_session(self, store_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Tests live Playwright session warm-up and authentication against H-E-B Store #390.
+        Checks login credentials, navigates to H-E-B, inspects WAF / session state,
+        and determines whether authentication succeeded or requires a 2FA code.
+        """
+        active_store = store_id or self.store_id
+        username = os.environ.get("HEB_USERNAME", "").strip()
+        password = os.environ.get("HEB_PASSWORD", "").strip()
+
+        logger.info(f"Initiating H-E-B session warm-up for Store #{active_store}")
+        logger.info(f"Configured account: {username if username else '(Unconfigured)'}")
+
+        session_result: Dict[str, Any] = {
+            "store_id": active_store,
+            "username": username or None,
+            "has_credentials": bool(username and password),
+            "authenticated": False,
+            "requires_2fa": False,
+            "status": "INITIALIZING",
+            "message": "",
+        }
+
+        if not username or not password:
+            session_result["status"] = "CREDENTIALS_MISSING"
+            session_result["message"] = "HEB_USERNAME or HEB_PASSWORD not set in environment."
+            return session_result
+
+        from playwright.sync_api import sync_playwright
+
+        try:
+            with sync_playwright() as p:
+                headless = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+                browser = p.chromium.launch(
+                    headless=headless,
+                    args=["--disable-blink-features=AutomationControlled"]
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800}
+                )
+                page = context.new_page()
+                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+                # Step A: Navigate to login page
+                logger.info("Navigating to https://www.heb.com/my-account/login ...")
+                page.goto("https://www.heb.com/my-account/login", timeout=25000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+
+                content = page.content()
+                current_url = page.url
+
+                # Check for Imperva WAF challenge or block
+                if "Pardon Our Interruption" in content or "errorCode" in content:
+                    logger.warning("Imperva Anti-Bot WAF challenge encountered on headless navigation.")
+                    session_result["status"] = "WAF_CHALLENGE_OR_2FA_REQUIRED"
+                    session_result["requires_2fa"] = True
+                    session_result["message"] = (
+                        "Imperva WAF bot challenge encountered. H-E-B requires interactive human verification "
+                        "or 2FA authorization (SMS/email one-time verification) to establish persistent session cookies."
+                    )
+                    browser.close()
+                    return session_result
+
+                # Check if already authenticated or form fields are present
+                email_input = page.query_selector("input[type='email'], input[name='email'], #email, #username")
+                pwd_input = page.query_selector("input[type='password'], input[name='password'], #password")
+
+                if email_input and pwd_input:
+                    logger.info("Login form detected. Submitting credentials...")
+                    email_input.fill(username)
+                    pwd_input.fill(password)
+                    submit_btn = page.query_selector("button[type='submit'], button:has-text('Sign In'), button:has-text('Log In')")
+                    if submit_btn:
+                        submit_btn.click()
+                        page.wait_for_timeout(5000)
+
+                    new_content = page.content()
+                    new_url = page.url
+
+                    if any(term in new_content.lower() for term in ["verification code", "two-factor", "one-time", "enter code", "verify your"]):
+                        logger.info("2FA verification challenge detected.")
+                        session_result["status"] = "REQUIRES_2FA"
+                        session_result["requires_2fa"] = True
+                        session_result["message"] = "H-E-B requires a 2FA verification code sent to user email/phone."
+                    elif "my-account" in new_url or "account" in new_url:
+                        logger.info("Authentication succeeded.")
+                        session_result["status"] = "AUTHENTICATED"
+                        session_result["authenticated"] = True
+                        session_result["message"] = "H-E-B session authenticated successfully."
+                        cookies = context.cookies()
+                        cache_file = Path(__file__).resolve().parent.parent / "cache" / "heb_session.json"
+                        cache_file.parent.mkdir(parents=True, exist_ok=True)
+                        with open(cache_file, "w") as f:
+                            json.dump(cookies, f, indent=2)
+                    else:
+                        session_result["status"] = "REQUIRES_VERIFICATION"
+                        session_result["requires_2fa"] = True
+                        session_result["message"] = "Interactive verification required by H-E-B."
+                else:
+                    session_result["status"] = "WAF_CHALLENGE_OR_2FA_REQUIRED"
+                    session_result["requires_2fa"] = True
+                    session_result["message"] = "Login form protected by WAF/2FA verification gate."
+
+                browser.close()
+        except Exception as ex:
+            logger.warning(f"Live Playwright warm-up encountered exception: {ex}")
+            session_result["status"] = "REQUIRES_2FA"
+            session_result["requires_2fa"] = True
+            session_result["message"] = f"Browser session requires interactive verification or 2FA: {ex}"
+
+        return session_result
 
     # ==========================================================================
     # 4-Tier Out-of-Stock (OOS) Fallback Cascade
@@ -388,16 +510,33 @@ def match_ingredient_to_sku(ingredient: Any, store_id: str = "390") -> Dict[str,
     return client.match_ingredient_to_sku(ingredient, store_id=store_id)
 
 
+def warm_up_session(store_id: Optional[str] = None) -> Dict[str, Any]:
+    """Clean module-level helper function for live Playwright session warm-up."""
+    client = HEBClient(store_id=store_id or os.environ.get("HEB_STORE_ID", "390"))
+    return client.warm_up_session(store_id=store_id)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="H-E-B Grocery Search & 4-Tier OOS Engine")
-    parser.add_argument("query", help="Ingredient or product search term")
-    parser.add_argument("--store-id", default="390", help="H-E-B store ID")
+    parser.add_argument("query", nargs="?", default=None, help="Ingredient or product search term (optional)")
+    parser.add_argument("--store-id", default=None, help="H-E-B store ID (defaults to HEB_STORE_ID or 390)")
     parser.add_argument("--tier-test", action="store_true", help="Simulate 4-tier cascade test")
+    parser.add_argument("--warmup", action="store_true", help="Perform live Playwright session warm-up and 2FA check")
 
     args = parser.parse_args()
 
-    client = HEBClient(store_id=args.store_id)
+    effective_store = args.store_id or os.environ.get("HEB_STORE_ID", "390")
+    client = HEBClient(store_id=effective_store)
+
+    # Perform session warm-up if requested or if no search query provided
+    if args.warmup or args.query is None:
+        print("=== H-E-B Live Playwright Session Warm-Up & Verification ===")
+        warmup_res = client.warm_up_session(store_id=effective_store)
+        print(json.dumps(warmup_res, indent=2))
+        if args.query is None:
+            sys.exit(0)
+
     results = client.search_heb_product(args.query)
 
     if args.tier_test:
