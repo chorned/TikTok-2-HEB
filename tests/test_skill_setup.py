@@ -230,7 +230,10 @@ class TestSkillSetupAndDiagnostics(unittest.TestCase):
             recipe_requirement="1.25 lbs Atlantic Salmon",
             heb_search_query="Atlantic Salmon",
         )
-        match = client.match_ingredient_to_sku(ing)
+        sample_pool = [
+            {"product_id": "319482", "name": "H-E-B Fresh Atlantic Salmon Fillet", "brand": "H-E-B", "price": 11.98, "in_stock": True, "package_size": "~1.25 lb tray"}
+        ]
+        match = client.match_ingredient_to_sku(ing, candidate_pool=sample_pool)
         self.assertIn(match["status"], ["SUCCESS", "SUBSTITUTED"])
         self.assertIn("sku", match)
 

@@ -71,14 +71,37 @@ For each ingredient in `ingredients_to_buy`, match against the local H-E-B store
 - **Tier 3 (Organic ↔ Conventional Swap):** Swap organic for conventional (or vice-versa) if store has only one in stock.
 - **Tier 4 (Package Size Adjustment / Human Escalation):** Adjust quantities (e.g. 2x 8 oz for 1x 16 oz) or flag category wipeout as `⚠️ OUT OF STOCK (NEEDS HUMAN CALL)`.
 
-### Step 5: Recipe Cache Persistence
+### Step 5: Direct GraphQL Cart Staging & Coupon Clipping (Zero Slow UI Clicks)
+Stage items and clip coupons directly via authenticated GraphQL operations (persisted queries `cartEstimated`, `cartItemV2`, `CouponClip` vendored from `texas-grocery-mcp`) using harvested Chrome CDP (`127.0.0.1:9222`) / `rookiepy` session tokens:
+
+```bash
+# 1. Harvest or refresh live session tokens
+python scripts/heb_client.py --harvest
+
+# 2. Inspect current live cart
+python scripts/heb_client.py --cart-get
+
+# 3. Stage candidate items (requires human-in-the-loop --confirm)
+python scripts/heb_client.py --cart-add <PRODUCT_ID> [--sku <SKU_ID>] [--qty <N>] --confirm
+
+# 4. Remove item from cart if swapped
+python scripts/heb_client.py --cart-remove <PRODUCT_ID> [--sku <SKU_ID>] --confirm
+
+# 5. Clip digital coupons
+python scripts/heb_client.py --coupon-clip <COUPON_ID> --confirm
+```
+
+> [!IMPORTANT]
+> **Human-in-the-Loop Checkout Gate:** AGY is strictly prohibited from executing checkout, payment, or delivery/pickup window booking mutations. Cart staging and digital coupon clipping only; Carl always reviews and taps final checkout in the My H-E-B mobile app.
+
+### Step 6: Recipe Cache Persistence
 Persist the parsed recipe to ensure future runs hit the Hot Path:
 
 ```bash
 python scripts/cache_manager.py save --file <RECIPE_DATA_YAML>
 ```
 
-### Step 6: Mobile Review Summary (iMessage / Slack)
+### Step 7: Mobile Review Summary (iMessage / Slack)
 Format the review for clean reading on mobile screens (avoid Markdown tables, use clean emoji bullet formatting):
 
 ```text

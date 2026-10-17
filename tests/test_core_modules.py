@@ -17,6 +17,7 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from unittest.mock import patch
 from scripts.extract_recipe_media import clean_subtitle_text, count_culinary_tokens
 from scripts.cache_manager import (
     HEBCartItem,
@@ -26,7 +27,14 @@ from scripts.cache_manager import (
     HouseholdScaler,
     CacheManager,
 )
-from scripts.heb_client import HEBClient, search_heb_product, match_ingredient_to_sku
+from scripts.heb_client import (
+    HEBClient,
+    search_heb_product,
+    match_ingredient_to_sku,
+    HEBWAFChallengeError,
+    HEBClientError,
+)
+
 
 
 class TestExtractRecipeMedia(unittest.TestCase):
@@ -171,13 +179,34 @@ class TestHEBClientAndCascade(unittest.TestCase):
         self.client = HEBClient(store_id="390")
 
     def test_search_heb_product(self):
-        results = search_heb_product("jasmine rice", store_id="390")
-        self.assertGreaterEqual(len(results), 3)
-        self.assertTrue(any("jasmine rice" in r["name"].lower() for r in results))
+        sample_cards = [
+            {"product_id": "590001", "name": "H-E-B Jasmine Rice", "brand": "H-E-B", "price": 4.48, "in_stock": True, "package_size": "16 oz"},
+            {"product_id": "590002", "name": "H-E-B Organics Jasmine Rice", "brand": "H-E-B Organics", "price": 5.28, "in_stock": True, "package_size": "16 oz"},
+            {"product_id": "590003", "name": "Central Market Jasmine Rice", "brand": "Central Market", "price": 5.99, "in_stock": True, "package_size": "1 lb"},
+        ]
+        with patch.object(self.client, "_search_via_playwright", return_value=sample_cards):
+            results = self.client.search_heb_product("jasmine rice", store_id="390")
+            self.assertGreaterEqual(len(results), 3)
+            self.assertTrue(any("jasmine rice" in r["name"].lower() for r in results))
+
+    def test_search_heb_product_waf_loud_failure(self):
+        """Verify that Imperva WAF challenges trigger a loud HEBWAFChallengeError."""
+        with patch.object(self.client, "_search_via_playwright", side_effect=HEBWAFChallengeError("Imperva Anti-Bot WAF challenge blocked search")):
+            with self.assertRaises(HEBWAFChallengeError):
+                self.client.search_heb_product("jasmine rice", store_id="390")
 
     def test_cascade_tier_1_exact_match(self):
-        candidates = self.client.search_heb_product("Atlantic Salmon")
-        target_id = str(candidates[0]["product_id"])
+        candidates = [
+            {
+                "product_id": "319482",
+                "name": "H-E-B Fresh Atlantic Salmon Fillet",
+                "brand": "H-E-B",
+                "package_size": "~1.25 lb tray",
+                "price": 11.98,
+                "in_stock": True,
+            }
+        ]
+        target_id = "319482"
 
         ingredient = ScaledIngredient(
             ingredient_key="salmon",
@@ -190,7 +219,7 @@ class TestHEBClientAndCascade(unittest.TestCase):
             ),
         )
 
-        match = self.client.match_ingredient_to_sku(ingredient)
+        match = self.client.match_ingredient_to_sku(ingredient, candidate_pool=candidates)
         self.assertEqual(match["tier"], 1)
         self.assertEqual(match["status"], "SUCCESS")
         self.assertEqual(match["sku"]["heb_product_id"], target_id)

@@ -28,6 +28,26 @@ try:
 except ImportError:
     pass
 
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+from scripts.heb_graphql import (
+    HEBGraphQLClient,
+    HEBGraphQLError,
+    HEBCheckoutGateError,
+    HEBClientError,
+    HEBWAFChallengeError,
+    HEBAuthenticationError,
+    PERSISTED_QUERIES,
+)
+from scripts.cdp_harvester import (
+    CDPSessionHarvester,
+    SessionState,
+    get_live_session,
+)
+
+
 # Default brand hierarchy
 DEFAULT_BRAND_HIERARCHY = [
     "H-E-B",
@@ -40,7 +60,7 @@ DEFAULT_BRAND_HIERARCHY = [
 
 
 class HEBClient:
-    """Client for H-E-B catalog searching and 4-tier OOS fallback matching."""
+    """Client for H-E-B catalog searching, GraphQL cart/coupon operations, and 4-tier OOS fallback matching."""
 
     def __init__(
         self,
@@ -51,6 +71,8 @@ class HEBClient:
         self.store_id = store_id or os.environ.get("HEB_STORE_ID", "639")
         self.brand_hierarchy = brand_hierarchy or DEFAULT_BRAND_HIERARCHY
         self.headless = headless
+        self.graphql_client = HEBGraphQLClient(store_id=self.store_id)
+        self.harvester = CDPSessionHarvester()
 
     def search_heb_product(
         self,
@@ -58,129 +80,159 @@ class HEBClient:
         store_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Searches H-E-B product catalog for an ingredient query.
+        Searches H-E-B product catalog for an ingredient query using live authenticated
+        GraphQL SSR extraction or live browser automation.
+        Raises HEBWAFChallengeError on Imperva WAF blocks.
+        Raises HEBAuthenticationError on auth failures.
         Returns a list of candidate product dictionaries.
         """
         active_store = store_id or self.store_id
         logger.info(f"Searching H-E-B catalog for '{query}' at store {active_store}")
 
-        candidates: List[Dict[str, Any]] = []
+        # 1. Try authenticated GraphQL SSR extraction first (fast, direct, no heavy UI clicks)
+        use_playwright = os.environ.get("USE_PLAYWRIGHT_SEARCH", "false").lower() == "true"
+        try:
+            ssr_results = self.graphql_client.product_search(query, store_id=active_store)
+            if ssr_results:
+                return ssr_results
+        except (HEBWAFChallengeError, HEBAuthenticationError) as challenge_err:
+            if not use_playwright:
+                raise
+            logger.info(
+                f"Direct GraphQL request encountered challenge ({challenge_err}); "
+                "escalating to browser automation."
+            )
+        except Exception as gql_err:
+            logger.debug(f"GraphQL SSR search returned error/empty: {gql_err}")
 
-        # 1. Attempt Playwright headless browser / authenticated session if available
-        # and not in simulated mode
-        if os.environ.get("USE_PLAYWRIGHT_SEARCH", "false").lower() == "true":
-            try:
-                candidates = self._search_via_playwright(query, active_store)
-                if candidates:
-                    return candidates
-            except Exception as e:
-                logger.warning(f"Playwright search failed: {e}. Falling back to internal engine.")
+        # 2. Check if Playwright fallback is enabled
+        if not use_playwright:
+            raise HEBClientError(
+                f"USE_PLAYWRIGHT_SEARCH is disabled and GraphQL SSR returned no items for '{query}' at store {active_store}. "
+                "Live H-E-B catalog search requires active browser automation or authenticated session; "
+                "heuristic mock catalog fallback has been completely removed."
+            )
 
-        # 2. Resilient heuristic catalog generator for common grocery queries
-        # Ensures deterministic local testing and zero-network resilience
-        candidates = self._heuristic_search_catalog(query)
-        return candidates
+        return self._search_via_playwright(query, active_store)
 
-    def _heuristic_search_catalog(self, query: str) -> List[Dict[str, Any]]:
-        """
-        Generates realistic candidate items matching the query across
-        different brand tiers (H-E-B, H-E-B Organics, Central Market, Hill Country Fare, National Brand).
-        """
-        q_clean = query.strip()
-        q_lower = q_clean.lower()
-        # Strip common store brand prefixes if user included them in query
-        base_term = re.sub(r"^(h-e-b|central market|hill country fare)\s+", "", q_clean, flags=re.I).strip()
+    def _extract_product_cards(self, page: Any) -> List[Dict[str, Any]]:
+        """Extracts real product cards from the H-E-B search results page."""
+        results: List[Dict[str, Any]] = []
+        cards = page.query_selector_all("[data-testid='product-card'], [class*='ProductCard']")
+        for card in cards[:10]:
+            title_elem = card.query_selector("h2, [class*='title'], [data-testid='product-title']")
+            price_elem = card.query_selector("[class*='price'], [data-testid='product-price']")
+            name = title_elem.inner_text().strip() if title_elem else ""
+            if not name or name == "Unknown Product":
+                continue
 
-        # Deterministic product ID generator based on term hash
-        import zlib
-        base_id = (zlib.crc32(base_term.lower().encode("utf-8")) % 800000) + 100000
+            price_str = price_elem.inner_text().strip() if price_elem else "0.0"
+            price_match = re.search(r"\d+(?:\.\d{1,2})?", price_str)
+            price_num = float(price_match.group(0)) if price_match else 0.0
 
-        # Construct candidates across brand hierarchy
-        items: List[Dict[str, Any]] = [
-            {
-                "product_id": str(base_id),
-                "name": f"H-E-B Fresh {base_term}",
-                "brand": "H-E-B",
-                "package_size": "~1.25 lb tray" if any(w in q_lower for w in ["salmon", "chicken", "beef", "meat"]) else "16 oz",
-                "price": 11.98 if "salmon" in q_lower else 4.48,
+            link_elem = card.query_selector("a[href*='product-detail']")
+            href = link_elem.get_attribute("href") if link_elem else ""
+            pid_match = re.search(r"/product-detail/(?:[^/]+/)?(\d+)", href) if href else None
+            if not pid_match:
+                # Require genuine H-E-B numeric product ID; synthetic mock fallback prohibited
+                continue
+            product_id = pid_match.group(1)
+
+            results.append({
+                "product_id": str(product_id),
+                "name": name,
+                "brand": "H-E-B" if "H-E-B" in name else "National Brand",
+                "package_size": "Standard",
+                "price": price_num,
                 "in_stock": True,
-                "is_organic": False,
-                "url": f"https://www.heb.com/product-detail/{base_id}",
-            },
-            {
-                "product_id": str(base_id + 1),
-                "name": f"H-E-B Organics {base_term}",
-                "brand": "H-E-B Organics",
-                "package_size": "~1.0 lb tray" if any(w in q_lower for w in ["salmon", "chicken", "beef", "meat"]) else "16 oz",
-                "price": 14.50 if "salmon" in q_lower else 5.28,
-                "in_stock": True,
-                "is_organic": True,
-                "url": f"https://www.heb.com/product-detail/{base_id + 1}",
-            },
-            {
-                "product_id": str(base_id + 2),
-                "name": f"Central Market Organics {base_term}",
-                "brand": "Central Market",
-                "package_size": "1 lb",
-                "price": 15.99 if "salmon" in q_lower else 5.99,
-                "in_stock": True,
-                "is_organic": True,
-                "url": f"https://www.heb.com/product-detail/{base_id + 2}",
-            },
-            {
-                "product_id": str(base_id + 3),
-                "name": f"Hill Country Fare {base_term}",
-                "brand": "Hill Country Fare",
-                "package_size": "24 oz",
-                "price": 8.99 if "salmon" in q_lower else 3.28,
-                "in_stock": True,
-                "is_organic": False,
-                "url": f"https://www.heb.com/product-detail/{base_id + 3}",
-            },
-            {
-                "product_id": str(base_id + 4),
-                "name": f"National Brand {base_term}",
-                "brand": "National Brand",
-                "package_size": "12 oz",
-                "price": 12.49 if "salmon" in q_lower else 4.99,
-                "in_stock": True,
-                "is_organic": False,
-                "url": f"https://www.heb.com/product-detail/{base_id + 4}",
-            },
-        ]
-
-        return items
+                "is_organic": "organic" in name.lower(),
+                "url": f"https://www.heb.com{href}" if href.startswith("/") else href,
+            })
+        return results
 
     def _search_via_playwright(self, query: str, store_id: str) -> List[Dict[str, Any]]:
-        """Headless browser scrape via Playwright if explicitly enabled."""
+        """Live browser scrape via Playwright with CDP and session cookie support."""
         from playwright.sync_api import sync_playwright
 
         results: List[Dict[str, Any]] = []
+        session_file = Path(__file__).resolve().parent.parent / "cache" / "heb_session.json"
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
-            context = browser.new_context(user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+            # 1. Try connecting to active Chrome session over CDP (port 9222) first
+            try:
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                context = browser.contexts[0]
+                page = context.new_page()
+                url = f"https://www.heb.com/search/?q={query}"
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(2000)
+                content = page.content()
+
+                is_waf = (
+                    "errorCode" in content
+                    or "Pardon Our Interruption" in content
+                    or "reese84" in content.lower()
+                    or "access denied" in content.lower()
+                    or "incapsula" in content.lower()
+                    or (resp and resp.status in (401, 403))
+                )
+                if is_waf:
+                    page.close()
+                    raise HEBWAFChallengeError(
+                        f"Imperva Anti-Bot WAF challenge encountered while searching for '{query}' at store {store_id}. "
+                        "Live interactive Chrome session on port 9222 was challenged."
+                    )
+
+                results = self._extract_product_cards(page)
+                page.close()
+                return results
+            except HEBWAFChallengeError:
+                raise
+            except Exception as cdp_err:
+                logger.debug(f"CDP attach note: {cdp_err}. Launching standalone Playwright instance.")
+
+            # 2. Standalone Playwright instance with cached cookies
+            browser = p.chromium.launch(
+                headless=self.headless,
+                ignore_default_args=["--enable-automation"],
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            )
+
+            if session_file.is_file():
+                try:
+                    with open(session_file, "r") as f:
+                        cookies = json.load(f)
+                    context.add_cookies(cookies)
+                    logger.info(f"Loaded {len(cookies)} cached session cookies from {session_file}")
+                except Exception as ex:
+                    logger.warning(f"Could not load session cookies: {ex}")
+
             page = context.new_page()
             url = f"https://www.heb.com/search/?q={query}"
-            page.goto(url, wait_until="networkidle", timeout=15000)
+            resp = page.goto(url, wait_until="networkidle", timeout=15000)
 
-            # Extract basic product cards if rendered
-            cards = page.query_selector_all("[data-testid='product-card'], [class*='ProductCard']")
-            for card in cards[:5]:
-                title_elem = card.query_selector("h2, [class*='title'], [data-testid='product-title']")
-                price_elem = card.query_selector("[class*='price'], [data-testid='product-price']")
-                name = title_elem.inner_text().strip() if title_elem else "Unknown Product"
-                price_str = price_elem.inner_text().strip() if price_elem else "0.0"
-                price_num = float(re.sub(r"[^\d.]", "", price_str) or "0.0")
+            content = page.content()
+            is_waf = (
+                "errorCode" in content
+                or "Pardon Our Interruption" in content
+                or "reese84" in content.lower()
+                or "access denied" in content.lower()
+                or "incapsula" in content.lower()
+                or (resp and resp.status in (401, 403))
+            )
+            if is_waf:
+                browser.close()
+                logger.error(f"Imperva Anti-Bot WAF challenge blocked search for '{query}' at store {store_id}.")
+                raise HEBWAFChallengeError(
+                    f"Imperva Anti-Bot WAF challenge blocked search for '{query}' at store {store_id}. "
+                    "Automated requests are blocked without interactive human/browser verification; "
+                    "synthetic mock fallback is prohibited."
+                )
 
-                results.append({
-                    "product_id": f"plw_{abs(hash(name)) % 100000}",
-                    "name": name,
-                    "brand": "H-E-B" if "H-E-B" in name else "National Brand",
-                    "package_size": "Standard",
-                    "price": price_num,
-                    "in_stock": True,
-                    "is_organic": "organic" in name.lower(),
-                })
+            results = self._extract_product_cards(page)
             browser.close()
 
         return results
@@ -188,14 +240,15 @@ class HEBClient:
     def warm_up_session(self, store_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Tests live Playwright session warm-up and authentication against H-E-B Store #639.
-        Checks login credentials, navigates to H-E-B, inspects WAF / session state,
-        and determines whether authentication succeeded or requires a 2FA code.
+        Checks login credentials, inspects active Chrome browser session on CDP 9222 or navigates to H-E-B,
+        inspects WAF / session state, and determines whether authentication succeeded or requires a 2FA code.
         """
         active_store = store_id or self.store_id
         username = os.environ.get("HEB_USERNAME", "").strip()
         password = os.environ.get("HEB_PASSWORD", "").strip()
+        session_file = Path(__file__).resolve().parent.parent / "cache" / "heb_session.json"
 
-        logger.info(f"Initiating H-E-B session warm-up for Store #{active_store}")
+        logger.info(f"Initiating H-E-B session warm-up for Store #{active_store} (Mueller)")
         logger.info(f"Configured account: {username if username else '(Unconfigured)'}")
 
         session_result: Dict[str, Any] = {
@@ -215,21 +268,82 @@ class HEBClient:
 
         from playwright.sync_api import sync_playwright
 
+        # First, check if real Chrome instance is active on CDP port 9222
+        try:
+            with sync_playwright() as p:
+                try:
+                    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                    context = browser.contexts[0]
+                    pages = [pg for pg in context.pages if "accounts.heb.com" in pg.url or "heb.com" in pg.url]
+                    if pages:
+                        page = pages[0]
+                        logger.info(f"Connected to live Chrome tab: {page.url} ({page.title()})")
+                        content = page.content()
+                        if "verify" in page.url.lower() or "enter verification code" in content.lower():
+                            logger.info("Live 2FA verification challenge detected in active Chrome tab.")
+                            session_result["status"] = "AWAITING_2FA_CODE"
+                            session_result["requires_2fa"] = True
+                            session_result["message"] = f"A 6-digit verification code was sent to {username} and is currently awaiting input in real Chrome."
+                            # Export cookies
+                            cookies = context.cookies()
+                            session_file.parent.mkdir(parents=True, exist_ok=True)
+                            with open(session_file, "w") as f:
+                                json.dump(cookies, f, indent=2)
+                            os.chmod(session_file, 0o600)
+                            return session_result
+                        elif "my-account" in page.url or "cart" in page.url or "heb.com" in page.url:
+                            cookies = context.cookies()
+                            if any(c["name"] in ["sst", "sat", "loginEmail", "_interaction", "_session"] for c in cookies):
+                                session_result["status"] = "AUTHENTICATED"
+                                session_result["authenticated"] = True
+                                session_result["message"] = f"Active authenticated session detected in real Chrome (Mueller Store #{active_store} pinned)."
+                                session_file.parent.mkdir(parents=True, exist_ok=True)
+                                with open(session_file, "w") as f:
+                                    json.dump(cookies, f, indent=2)
+                                os.chmod(session_file, 0o600)
+                                return session_result
+                except Exception as cdp_err:
+                    logger.debug(f"CDP attach note: {cdp_err}")
+        except Exception:
+            pass
+
+        # Second, check if authenticated session cookies are already persisted in cache
+        if session_file.is_file():
+            try:
+                with open(session_file, "r") as f:
+                    cached_cookies = json.load(f)
+                if any(c.get("name") in ["sst", "sat", "_session"] for c in cached_cookies):
+                    logger.info(f"Authenticated session loaded from cache ({len(cached_cookies)} cookies)")
+                    session_result["status"] = "AUTHENTICATED"
+                    session_result["authenticated"] = True
+                    session_result["message"] = f"Authenticated session active from cached cookies ({len(cached_cookies)} cookies, Mueller Store #{active_store})."
+                    return session_result
+            except Exception as e:
+                logger.warning(f"Could not load cached session: {e}")
+
+        # Standalone Playwright inspection
         try:
             with sync_playwright() as p:
                 headless = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
                 browser = p.chromium.launch(
                     headless=headless,
+                    ignore_default_args=["--enable-automation"],
                     args=["--disable-blink-features=AutomationControlled"]
                 )
                 context = browser.new_context(
                     user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                     viewport={"width": 1280, "height": 800}
                 )
-                page = context.new_page()
-                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                if session_file.is_file():
+                    try:
+                        with open(session_file, "r") as f:
+                            c = json.load(f)
+                        context.add_cookies(c)
+                        logger.info(f"Loaded {len(c)} session cookies from {session_file}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load cached cookies: {e}")
 
-                # Step A: Navigate to login page
+                page = context.new_page()
                 logger.info("Navigating to https://www.heb.com/my-account/login ...")
                 page.goto("https://www.heb.com/my-account/login", timeout=25000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
@@ -237,57 +351,29 @@ class HEBClient:
                 content = page.content()
                 current_url = page.url
 
-                # Check for Imperva WAF challenge or block
                 if "Pardon Our Interruption" in content or "errorCode" in content:
-                    logger.warning("Imperva Anti-Bot WAF challenge encountered on headless navigation.")
                     session_result["status"] = "WAF_CHALLENGE_OR_2FA_REQUIRED"
                     session_result["requires_2fa"] = True
                     session_result["message"] = (
-                        "Imperva WAF bot challenge encountered. H-E-B requires interactive human verification "
-                        "or 2FA authorization (SMS/email one-time verification) to establish persistent session cookies."
+                        "Imperva WAF bot challenge encountered on automated session. "
+                        "Live 2FA session code is active on real Google Chrome."
                     )
                     browser.close()
                     return session_result
 
-                # Check if already authenticated or form fields are present
-                email_input = page.query_selector("input[type='email'], input[name='email'], #email, #username")
-                pwd_input = page.query_selector("input[type='password'], input[name='password'], #password")
-
-                if email_input and pwd_input:
-                    logger.info("Login form detected. Submitting credentials...")
-                    email_input.fill(username)
-                    pwd_input.fill(password)
-                    submit_btn = page.query_selector("button[type='submit'], button:has-text('Sign In'), button:has-text('Log In')")
-                    if submit_btn:
-                        submit_btn.click()
-                        page.wait_for_timeout(5000)
-
-                    new_content = page.content()
-                    new_url = page.url
-
-                    if any(term in new_content.lower() for term in ["verification code", "two-factor", "one-time", "enter code", "verify your"]):
-                        logger.info("2FA verification challenge detected.")
-                        session_result["status"] = "REQUIRES_2FA"
-                        session_result["requires_2fa"] = True
-                        session_result["message"] = "H-E-B requires a 2FA verification code sent to user email/phone."
-                    elif "my-account" in new_url or "account" in new_url:
-                        logger.info("Authentication succeeded.")
-                        session_result["status"] = "AUTHENTICATED"
-                        session_result["authenticated"] = True
-                        session_result["message"] = "H-E-B session authenticated successfully."
-                        cookies = context.cookies()
-                        cache_file = Path(__file__).resolve().parent.parent / "cache" / "heb_session.json"
-                        cache_file.parent.mkdir(parents=True, exist_ok=True)
-                        with open(cache_file, "w") as f:
-                            json.dump(cookies, f, indent=2)
-                    else:
-                        session_result["status"] = "REQUIRES_VERIFICATION"
-                        session_result["requires_2fa"] = True
-                        session_result["message"] = "Interactive verification required by H-E-B."
-                else:
-                    session_result["status"] = "WAF_CHALLENGE_OR_2FA_REQUIRED"
+                if any(term in content.lower() for term in ["verification code", "two-factor", "one-time", "enter code"]):
+                    session_result["status"] = "AWAITING_2FA_CODE"
                     session_result["requires_2fa"] = True
-                    session_result["message"] = "Login form protected by WAF/2FA verification gate."
+                    session_result["message"] = f"A 6-digit verification code was sent to {username} and is awaiting input."
+                elif "my-account" in current_url:
+                    session_result["status"] = "AUTHENTICATED"
+                    session_result["authenticated"] = True
+                    session_result["message"] = "H-E-B session authenticated successfully."
+                    cookies = context.cookies()
+                    session_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(session_file, "w") as f:
+                        json.dump(cookies, f, indent=2)
+                    os.chmod(session_file, 0o600)
 
                 browser.close()
         except Exception as ex:
@@ -297,6 +383,139 @@ class HEBClient:
             session_result["message"] = f"Browser session requires interactive verification or 2FA: {ex}"
 
         return session_result
+
+    def submit_2fa_code(self, code: str) -> Dict[str, Any]:
+        """Submits a 6-digit OTP code into the active H-E-B verification page in real Chrome."""
+        clean_code = re.sub(r"\D", "", code).strip()
+        if len(clean_code) != 6:
+            return {"ok": False, "error": f"Invalid verification code format (expected 6 digits, got '{code}')"}
+
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            context = browser.contexts[0]
+            pages = [pg for pg in context.pages if "accounts.heb.com" in pg.url and "verify" in pg.url]
+            if not pages:
+                return {"ok": False, "error": "No active H-E-B verification page found in Chrome."}
+            page = pages[0]
+            for idx, digit in enumerate(clean_code, 1):
+                inp = page.query_selector(f"input[name='code_input_{idx}']")
+                if inp:
+                    inp.fill(digit)
+            page.wait_for_timeout(500)
+            verify_btn = page.query_selector("button:has-text('Verify')")
+            if verify_btn:
+                verify_btn.click()
+            page.wait_for_timeout(6000)
+
+            # Export updated cookies
+            cookies = context.cookies()
+            cache_file = Path(__file__).resolve().parent.parent / "cache" / "heb_session.json"
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump(cookies, f, indent=2)
+            os.chmod(cache_file, 0o600)
+
+            return {
+                "ok": True,
+                "url": page.url,
+                "title": page.title(),
+                "cookies_count": len(cookies)
+            }
+
+    # ==========================================================================
+    # GraphQL & Cart Operations (vendored from texas-grocery-mcp)
+    # ==========================================================================
+
+    def cart_get(self) -> Dict[str, Any]:
+        """
+        Retrieves current H-E-B cart contents via persisted query 'cartEstimated'.
+        Returns normalized items, count, and subtotal.
+        """
+        return self.graphql_client.cart_get()
+
+    def cart_add(
+        self,
+        product_id: str,
+        sku_id: Optional[str] = None,
+        quantity: int = 1,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Adds an item to the live H-E-B shopping cart via 'cartItemV2'.
+        Requires confirm=True to execute (Human-in-the-Loop Confirmation Gate).
+        Verifies addition via cart_get().
+        """
+        return self.graphql_client.cart_add(
+            product_id=product_id,
+            sku_id=sku_id,
+            quantity=quantity,
+            confirm=confirm,
+        )
+
+    def cart_add_many(
+        self,
+        items: List[Dict[str, Any]],
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Adds multiple items to the cart in sequence via 'cartItemV2'.
+        Requires confirm=True to execute (Human-in-the-Loop Confirmation Gate).
+        """
+        return self.graphql_client.cart_add_many(items=items, confirm=confirm)
+
+    def cart_remove(
+        self,
+        product_id: str,
+        sku_id: Optional[str] = None,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Removes an item from the cart via 'cartItemV2' with quantity 0.
+        Requires confirm=True to execute (Human-in-the-Loop Confirmation Gate).
+        """
+        return self.graphql_client.cart_remove(
+            product_id=product_id,
+            sku_id=sku_id,
+            confirm=confirm,
+        )
+
+    def coupon_clip(self, coupon_id: int, confirm: bool = False) -> Dict[str, Any]:
+        """
+        Clips an H-E-B digital coupon to the user account using persisted query 'CouponClip'.
+        Requires confirm=True to execute (Human-in-the-Loop Confirmation Gate).
+        """
+        return self.graphql_client.coupon_clip(coupon_id=coupon_id, confirm=confirm)
+
+    def product_search(
+        self,
+        query: str,
+        store_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Direct authenticated SSR search for products (from texas-grocery-mcp).
+        """
+        return self.graphql_client.product_search(query=query, store_id=store_id or self.store_id, limit=limit)
+
+    def product_search_batch(
+        self,
+        queries: List[str],
+        store_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Searches multiple ingredient queries in batch via authenticated SSR.
+        """
+        return self.graphql_client.product_search_batch(queries=queries, store_id=store_id or self.store_id, limit=limit)
+
+    def harvest_session(self, ensure_warmup: bool = True) -> SessionState:
+        """
+        Harvests live cookies prioritizing Chrome over CDP (127.0.0.1:9222).
+        Falls back to rookiepy local Chrome extraction or saved cache.
+        """
+        return self.harvester.harvest(ensure_warmup=ensure_warmup)
 
     # ==========================================================================
     # 4-Tier Out-of-Stock (OOS) Fallback Cascade
@@ -516,6 +735,81 @@ def warm_up_session(store_id: Optional[str] = None) -> Dict[str, Any]:
     return client.warm_up_session(store_id=store_id)
 
 
+def cart_get(store_id: str = "639") -> Dict[str, Any]:
+    """Clean module-level helper function for retrieving cart contents."""
+    client = HEBClient(store_id=store_id)
+    return client.cart_get()
+
+
+def cart_add(
+    product_id: str,
+    sku_id: Optional[str] = None,
+    quantity: int = 1,
+    confirm: bool = False,
+    store_id: str = "639",
+) -> Dict[str, Any]:
+    """Clean module-level helper function for adding an item to the cart."""
+    client = HEBClient(store_id=store_id)
+    return client.cart_add(product_id=product_id, sku_id=sku_id, quantity=quantity, confirm=confirm)
+
+
+def cart_add_many(
+    items: List[Dict[str, Any]],
+    confirm: bool = False,
+    store_id: str = "639",
+) -> Dict[str, Any]:
+    """Clean module-level helper function for adding multiple items to the cart."""
+    client = HEBClient(store_id=store_id)
+    return client.cart_add_many(items=items, confirm=confirm)
+
+
+def cart_remove(
+    product_id: str,
+    sku_id: Optional[str] = None,
+    confirm: bool = False,
+    store_id: str = "639",
+) -> Dict[str, Any]:
+    """Clean module-level helper function for removing an item from the cart."""
+    client = HEBClient(store_id=store_id)
+    return client.cart_remove(product_id=product_id, sku_id=sku_id, confirm=confirm)
+
+
+def coupon_clip(
+    coupon_id: int,
+    confirm: bool = False,
+    store_id: str = "639",
+) -> Dict[str, Any]:
+    """Clean module-level helper function for clipping a digital coupon."""
+    client = HEBClient(store_id=store_id)
+    return client.coupon_clip(coupon_id=coupon_id, confirm=confirm)
+
+
+def product_search(
+    query: str,
+    store_id: str = "639",
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Clean module-level helper function for direct authenticated SSR search."""
+    client = HEBClient(store_id=store_id)
+    return client.product_search(query=query, store_id=store_id, limit=limit)
+
+
+def product_search_batch(
+    queries: List[str],
+    store_id: str = "639",
+    limit: int = 10,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Clean module-level helper function for batch SSR search."""
+    client = HEBClient(store_id=store_id)
+    return client.product_search_batch(queries=queries, store_id=store_id, limit=limit)
+
+
+def harvest_session(ensure_warmup: bool = True) -> SessionState:
+    """Clean module-level helper function to harvest session cookies."""
+    harvester = CDPSessionHarvester()
+    return harvester.harvest(ensure_warmup=ensure_warmup)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="H-E-B Grocery Search & 4-Tier OOS Engine")
@@ -523,11 +817,80 @@ if __name__ == "__main__":
     parser.add_argument("--store-id", default=None, help="H-E-B store ID (defaults to HEB_STORE_ID or 639)")
     parser.add_argument("--tier-test", action="store_true", help="Simulate 4-tier cascade test")
     parser.add_argument("--warmup", action="store_true", help="Perform live Playwright session warm-up and 2FA check")
+    parser.add_argument("--submit-code", default=None, help="Submit 6-digit 2FA verification code to active Chrome session")
+    parser.add_argument("--harvest", action="store_true", help="Harvest live session cookies from Chrome CDP (9222) / rookiepy")
+    parser.add_argument("--cart-get", action="store_true", help="Retrieve current cart contents via GraphQL")
+    parser.add_argument("--cart-add", default=None, help="Product ID to add to cart via GraphQL")
+    parser.add_argument("--cart-remove", default=None, help="Product ID to remove from cart via GraphQL")
+    parser.add_argument("--coupon-clip", type=int, default=None, help="Digital coupon ID to clip via GraphQL")
+    parser.add_argument("--sku", default=None, help="SKU ID for cart add/remove operations")
+    parser.add_argument("--qty", type=int, default=1, help="Quantity to order for cart add (default 1)")
+    parser.add_argument("--confirm", action="store_true", help="Human-in-the-loop confirmation gate for cart mutations")
+    parser.add_argument("--batch-search", default=None, help="Comma-separated product queries for batch search")
 
     args = parser.parse_args()
 
     effective_store = args.store_id or os.environ.get("HEB_STORE_ID", "639")
     client = HEBClient(store_id=effective_store)
+
+    if args.submit_code:
+        print("=== Submitting 2FA Verification Code to Real Chrome ===")
+        res = client.submit_2fa_code(args.submit_code)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
+
+    if args.harvest:
+        print("=== Harvesting H-E-B Session Cookies (CDP 9222 / Rookiepy) ===")
+        session_state = client.harvest_session(ensure_warmup=True)
+        print(f"Source: {session_state.source}")
+        print(f"Total Cookies: {len(session_state.cookies)}")
+        print(f"Authenticated (sst/sat): {session_state.is_authenticated}")
+        print(f"reese84 Token Present: {session_state.has_reese84}")
+        print(f"Sample Cookie Names: {list(session_state.cookies.keys())[:10]}")
+        sys.exit(0)
+
+    if args.cart_get:
+        print("=== H-E-B Cart Contents (GraphQL cartEstimated) ===")
+        cart_res = client.cart_get()
+        print(json.dumps(cart_res, indent=2))
+        sys.exit(0)
+
+    if args.cart_add:
+        print(f"=== H-E-B Cart Add: {args.cart_add} (qty={args.qty}, confirm={args.confirm}) ===")
+        cart_res = client.cart_add(
+            product_id=args.cart_add,
+            sku_id=args.sku,
+            quantity=args.qty,
+            confirm=args.confirm,
+        )
+        print(json.dumps(cart_res, indent=2))
+        sys.exit(0)
+
+    if args.cart_remove:
+        print(f"=== H-E-B Cart Remove: {args.cart_remove} (confirm={args.confirm}) ===")
+        cart_res = client.cart_remove(
+            product_id=args.cart_remove,
+            sku_id=args.sku,
+            confirm=args.confirm,
+        )
+        print(json.dumps(cart_res, indent=2))
+        sys.exit(0)
+
+    if args.coupon_clip is not None:
+        print(f"=== H-E-B Coupon Clip: #{args.coupon_clip} (confirm={args.confirm}) ===")
+        clip_res = client.coupon_clip(
+            coupon_id=args.coupon_clip,
+            confirm=args.confirm,
+        )
+        print(json.dumps(clip_res, indent=2))
+        sys.exit(0)
+
+    if args.batch_search:
+        queries = [q.strip() for q in args.batch_search.split(",") if q.strip()]
+        print(f"=== H-E-B Batch Product Search ({len(queries)} queries) ===")
+        batch_res = client.product_search_batch(queries, store_id=effective_store)
+        print(json.dumps(batch_res, indent=2))
+        sys.exit(0)
 
     # Perform session warm-up if requested or if no search query provided
     if args.warmup or args.query is None:
@@ -537,18 +900,29 @@ if __name__ == "__main__":
         if args.query is None:
             sys.exit(0)
 
-    results = client.search_heb_product(args.query)
+    try:
+        results = client.search_heb_product(args.query)
 
-    if args.tier_test:
-        test_ing = {
-            "ingredient_key": "salmon_fillet",
-            "recipe_requirement": f"1.25 lbs {args.query}",
-            "heb_search_query": args.query,
-            "primary_sku": {"heb_product_id": "nonexistent_sku", "quantity_to_order": 1},
-        }
-        cascade_match = client.match_ingredient_to_sku(test_ing)
-        print("=== 4-Tier Cascade Match ===")
-        print(json.dumps(cascade_match, indent=2))
-    else:
-        print(f"=== H-E-B Search Results for '{args.query}' ({len(results)} items) ===")
-        print(json.dumps(results, indent=2))
+        if args.tier_test:
+            test_ing = {
+                "ingredient_key": "salmon_fillet",
+                "recipe_requirement": f"1.25 lbs {args.query}",
+                "heb_search_query": args.query,
+                "primary_sku": {"heb_product_id": "nonexistent_sku", "quantity_to_order": 1},
+            }
+            cascade_match = client.match_ingredient_to_sku(test_ing)
+            print("=== 4-Tier Cascade Match ===")
+            print(json.dumps(cascade_match, indent=2))
+        else:
+            print(f"=== H-E-B Search Results for '{args.query}' ({len(results)} items) ===")
+            print(json.dumps(results, indent=2))
+    except HEBClientError as err:
+        logger.error(f"H-E-B search failed loudly: {err}")
+        print(json.dumps({
+            "status": "ERROR",
+            "error_type": type(err).__name__,
+            "message": str(err)
+        }, indent=2), file=sys.stderr)
+        sys.exit(1)
+
+
