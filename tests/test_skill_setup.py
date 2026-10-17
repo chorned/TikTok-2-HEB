@@ -127,7 +127,7 @@ class TestSkillSetupAndDiagnostics(unittest.TestCase):
         if not store_id:
             self.audit.add_issue(
                 "HEB_STORE_ID environment variable is unset",
-                "Add HEB_STORE_ID=390 (or your preferred store ID) to .env"
+                "Add HEB_STORE_ID=639 (or your preferred store ID) to .env"
             )
 
         # Check Gemini API Key
@@ -224,7 +224,7 @@ class TestSkillSetupAndDiagnostics(unittest.TestCase):
         self.assertTrue(scaler.is_kid_sensitive("sriracha hot sauce"))
 
         # C. HEB 4-Tier Fallback Cascade
-        client = HEBClient(store_id="390")
+        client = HEBClient(store_id="639")
         ing = ScaledIngredient(
             ingredient_key="salmon",
             recipe_requirement="1.25 lbs Atlantic Salmon",

@@ -17,8 +17,10 @@ household:
 
 store:
   provider: "heb"
-  # Primary H-E-B store ID (e.g. '390' for Austin - S Congress/Oltorf, '425' for Westlake)
-  store_id: "390"
+  # Primary H-E-B store ID (e.g. '639' for Mueller H-E-B, '390' for Austin - S Congress/Oltorf, '425' for Westlake)
+  store_id: "639"
+  store_name: "Mueller H-E-B"
+  store_address: "1801 E. 51st Street, Austin, TX 78723-3014"
   
   # Brand hierarchy for out-of-stock fallback matching
   brand_hierarchy:

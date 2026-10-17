@@ -44,11 +44,11 @@ class HEBClient:
 
     def __init__(
         self,
-        store_id: str = "390",
+        store_id: str = "639",
         brand_hierarchy: Optional[List[str]] = None,
         headless: bool = True,
     ):
-        self.store_id = store_id or os.environ.get("HEB_STORE_ID", "390")
+        self.store_id = store_id or os.environ.get("HEB_STORE_ID", "639")
         self.brand_hierarchy = brand_hierarchy or DEFAULT_BRAND_HIERARCHY
         self.headless = headless
 
@@ -187,7 +187,7 @@ class HEBClient:
 
     def warm_up_session(self, store_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Tests live Playwright session warm-up and authentication against H-E-B Store #390.
+        Tests live Playwright session warm-up and authentication against H-E-B Store #639.
         Checks login credentials, navigates to H-E-B, inspects WAF / session state,
         and determines whether authentication succeeded or requires a 2FA code.
         """
@@ -498,13 +498,13 @@ class HEBClient:
 # Helper / Standalone CLI
 # ==============================================================================
 
-def search_heb_product(query: str, store_id: str = "390") -> List[Dict[str, Any]]:
+def search_heb_product(query: str, store_id: str = "639") -> List[Dict[str, Any]]:
     """Clean module-level helper function for searching H-E-B products."""
     client = HEBClient(store_id=store_id)
     return client.search_heb_product(query, store_id=store_id)
 
 
-def match_ingredient_to_sku(ingredient: Any, store_id: str = "390") -> Dict[str, Any]:
+def match_ingredient_to_sku(ingredient: Any, store_id: str = "639") -> Dict[str, Any]:
     """Clean module-level helper function for 4-tier OOS fallback matching."""
     client = HEBClient(store_id=store_id)
     return client.match_ingredient_to_sku(ingredient, store_id=store_id)
@@ -512,7 +512,7 @@ def match_ingredient_to_sku(ingredient: Any, store_id: str = "390") -> Dict[str,
 
 def warm_up_session(store_id: Optional[str] = None) -> Dict[str, Any]:
     """Clean module-level helper function for live Playwright session warm-up."""
-    client = HEBClient(store_id=store_id or os.environ.get("HEB_STORE_ID", "390"))
+    client = HEBClient(store_id=store_id or os.environ.get("HEB_STORE_ID", "639"))
     return client.warm_up_session(store_id=store_id)
 
 
@@ -520,13 +520,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="H-E-B Grocery Search & 4-Tier OOS Engine")
     parser.add_argument("query", nargs="?", default=None, help="Ingredient or product search term (optional)")
-    parser.add_argument("--store-id", default=None, help="H-E-B store ID (defaults to HEB_STORE_ID or 390)")
+    parser.add_argument("--store-id", default=None, help="H-E-B store ID (defaults to HEB_STORE_ID or 639)")
     parser.add_argument("--tier-test", action="store_true", help="Simulate 4-tier cascade test")
     parser.add_argument("--warmup", action="store_true", help="Perform live Playwright session warm-up and 2FA check")
 
     args = parser.parse_args()
 
-    effective_store = args.store_id or os.environ.get("HEB_STORE_ID", "390")
+    effective_store = args.store_id or os.environ.get("HEB_STORE_ID", "639")
     client = HEBClient(store_id=effective_store)
 
     # Perform session warm-up if requested or if no search query provided
