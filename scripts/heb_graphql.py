@@ -81,12 +81,13 @@ class HEBGraphQLClient:
     def __init__(self, endpoint: str = HEB_GRAPHQL_ENDPOINT, store_id: str = "639"):
         self.endpoint = endpoint
         self.store_id = store_id or os.environ.get("HEB_STORE_ID", "639")
+        self.harvester = CDPSessionHarvester()
         self._session_state: Optional[SessionState] = None
 
     def get_session(self, force_refresh: bool = False) -> SessionState:
         """Retrieves active session state using the CDP/Rookiepy harvester."""
         if self._session_state is None or force_refresh:
-            self._session_state = get_live_session()
+            self._session_state = self.harvester.harvest()
         return self._session_state
 
     def execute_persisted_query(
@@ -98,6 +99,7 @@ class HEBGraphQLClient:
         """
         Executes a persisted GraphQL query hash against H-E-B.
         Raises HEBCheckoutGateError if a forbidden mutation is requested.
+        Enforces Iron Law of External Integrations for expired sat authentication.
         """
         # Strict Safety Invariant Gate
         if operation_name.lower() in FORBIDDEN_OPERATIONS or any(f in operation_name.lower() for f in ["pay", "checkout", "placeorder"]):
@@ -108,6 +110,32 @@ class HEBGraphQLClient:
 
         if operation_name not in PERSISTED_QUERIES:
             raise ValueError(f"Unknown persisted query operation: '{operation_name}'")
+
+        state = session_state or self.get_session()
+
+        # Check authentication requirements for user-scoped operations
+        auth_operations = {"cartEstimated", "cartItemV2", "CouponClip", "SelectPickupFulfillment"}
+        if operation_name in auth_operations:
+            if state.has_sat and not state.is_sat_valid:
+                raise HEBAuthenticationError(
+                    f"H-E-B Session Access Token ('sat') expired at timestamp {state.sat_expires_at}. "
+                    "An active human login session is required at https://www.heb.com/my-account/login. "
+                    "Under the Iron Law of External Integrations, execution halted at authentication boundary."
+                )
+            if not state.is_authenticated and not state.has_sat and not state.has_sst:
+                raise HEBAuthenticationError(
+                    "H-E-B authentication session cookies ('sat', 'sst') are missing. "
+                    "Login required at https://www.heb.com/my-account/login."
+                )
+            # If reese84 token is expired/missing, attempt 5-second Playwright warm-up
+            if not state.has_valid_reese84:
+                try:
+                    refreshed = self.harvester.refresh_session_with_playwright(headless=True, timeout=20000, warmup_seconds=5.0)
+                    if refreshed and refreshed.source != "playwright_failed":
+                        state = refreshed
+                        self._session_state = refreshed
+                except Exception as ref_err:
+                    logger.debug(f"Playwright reese84 refresh note: {ref_err}")
 
         hash_val = PERSISTED_QUERIES[operation_name]
         payload = {
@@ -120,8 +148,6 @@ class HEBGraphQLClient:
                 }
             },
         }
-
-        state = session_state or self.get_session()
 
         # Strategy 1: If CDP page is active, execute directly in the real Chrome context
         if state.cdp_page:
@@ -152,41 +178,58 @@ class HEBGraphQLClient:
             except Exception as ex:
                 logger.debug(f"CDP in-page fetch fallback note: {ex}")
 
-        # Strategy 2: Execute via curl_cffi with browser TLS impersonation
-        try:
-            from curl_cffi import requests as cffi_requests
-            headers = {
-                "User-Agent": state.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Origin": "https://www.heb.com",
-                "Referer": "https://www.heb.com/cart",
-                "Content-Type": "application/json",
-            }
-            resp = cffi_requests.post(
-                self.endpoint,
-                json=payload,
-                headers=headers,
-                cookies=state.cookies,
-                impersonate="chrome120",
-                timeout=15,
-            )
+        # Strategy 2: Execute via curl_cffi with browser TLS impersonation (or httpx fallback)
+        headers = {
+            "User-Agent": state.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.heb.com",
+            "Referer": "https://www.heb.com/cart",
+            "Content-Type": "application/json",
+        }
 
-            if resp.status_code == 200:
-                data = resp.json()
+        try:
+            try:
+                from curl_cffi import requests as cffi_requests
+                resp = cffi_requests.post(
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    cookies=state.cookies,
+                    impersonate="chrome120",
+                    timeout=15,
+                )
+                status_code = resp.status_code
+                resp_text = resp.text
+                resp_json = resp.json
+            except ImportError:
+                import httpx
+                h_resp = httpx.post(
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    cookies=state.cookies,
+                    timeout=15.0,
+                )
+                status_code = h_resp.status_code
+                resp_text = h_resp.text
+                resp_json = h_resp.json
+
+            if status_code == 200:
+                data = resp_json()
                 if "errors" in data and data["errors"]:
                     err_text = str(data["errors"]).lower()
                     if "auth" in err_text or "unauthorized" in err_text:
                         raise HEBAuthenticationError(f"H-E-B GraphQL authentication failure: {data['errors']}")
                     raise HEBGraphQLError(f"GraphQL returned errors: {data['errors']}")
                 return data.get("data", data)
-            elif resp.status_code in (401, 403) or "errorCode" in resp.text or "Pardon Our Interruption" in resp.text:
-                if "errorCode" in resp.text or "Pardon Our Interruption" in resp.text:
-                    raise HEBWAFChallengeError(f"Imperva Anti-Bot WAF challenge intercepted request (HTTP {resp.status_code}): {resp.text[:200]}")
-                if resp.status_code == 401 or "unauthorized" in resp.text.lower():
-                    raise HEBAuthenticationError(f"H-E-B authentication error (HTTP {resp.status_code}): session expired or missing.")
-                raise HEBWAFChallengeError(f"Imperva Anti-Bot WAF challenge intercepted request (HTTP {resp.status_code}): {resp.text[:200]}")
+            elif status_code in (401, 403) or "errorCode" in resp_text or "Pardon Our Interruption" in resp_text:
+                if "errorCode" in resp_text or "Pardon Our Interruption" in resp_text:
+                    raise HEBWAFChallengeError(f"Imperva Anti-Bot WAF challenge intercepted request (HTTP {status_code}): {resp_text[:200]}")
+                if status_code == 401 or "unauthorized" in resp_text.lower():
+                    raise HEBAuthenticationError(f"H-E-B authentication error (HTTP {status_code}): session expired or missing.")
+                raise HEBWAFChallengeError(f"Imperva Anti-Bot WAF challenge intercepted request (HTTP {status_code}): {resp_text[:200]}")
             else:
-                resp.raise_for_status()
+                raise HEBGraphQLError(f"H-E-B GraphQL request returned HTTP status {status_code}: {resp_text[:200]}")
 
         except Exception as e:
             if isinstance(e, (HEBClientError, HEBCheckoutGateError)):

@@ -12,6 +12,7 @@ Unit tests for H-E-B GraphQL Engine & CDP Session Harvester:
 import os
 import sys
 import json
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,7 +20,12 @@ from unittest.mock import MagicMock, patch
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.cdp_harvester import CDPSessionHarvester, SessionState
+from scripts.cdp_harvester import (
+    CDPSessionHarvester,
+    SessionState,
+    is_reese84_valid,
+    check_sat_token,
+)
 from scripts.heb_graphql import (
     HEBGraphQLClient,
     HEBGraphQLError,
@@ -297,5 +303,122 @@ class TestHEBClientIntegration(unittest.TestCase):
             self.assertNotIn("590328", content)
 
 
+class TestReese84AndSatValidation(unittest.TestCase):
+    """Unit tests for token validity checking, JWT expiration, and Playwright refresh."""
+
+    def test_is_reese84_valid_unexpired(self):
+        future_ms = (time.time() + 3600) * 1000  # 1 hour in future
+        storage_state = {
+            "origins": [
+                {
+                    "origin": "https://www.heb.com",
+                    "localStorage": [
+                        {"name": "reese84", "value": json.dumps({"renewTime": future_ms, "renewInSec": 850})}
+                    ]
+                }
+            ]
+        }
+        valid, exp = is_reese84_valid(storage_state)
+        self.assertTrue(valid)
+        self.assertIsNotNone(exp)
+
+    def test_is_reese84_valid_expired(self):
+        past_ms = (time.time() - 3600) * 1000  # 1 hour in past
+        storage_state = {
+            "origins": [
+                {
+                    "origin": "https://www.heb.com",
+                    "localStorage": [
+                        {"name": "reese84", "value": json.dumps({"renewTime": past_ms, "renewInSec": 850})}
+                    ]
+                }
+            ]
+        }
+        valid, exp = is_reese84_valid(storage_state)
+        self.assertFalse(valid)
+
+    def test_is_reese84_valid_missing(self):
+        valid, exp = is_reese84_valid({})
+        self.assertFalse(valid)
+        self.assertIsNone(exp)
+
+    def test_check_sat_token_valid(self):
+        import base64
+        future_exp = int(time.time() + 3600)
+        payload = base64.b64encode(json.dumps({"sub": "user123", "exp": future_exp}).encode("utf-8")).decode("utf-8")
+        fake_jwt = f"eyJhbGciOiJIUzI1NiJ9.{payload}.signature"
+        is_valid, exp = check_sat_token(fake_jwt)
+        self.assertTrue(is_valid)
+        self.assertEqual(exp, float(future_exp))
+
+    def test_check_sat_token_expired(self):
+        import base64
+        past_exp = int(time.time() - 3600)
+        payload = base64.b64encode(json.dumps({"sub": "user123", "exp": past_exp}).encode("utf-8")).decode("utf-8")
+        fake_jwt = f"eyJhbGciOiJIUzI1NiJ9.{payload}.signature"
+        is_valid, exp = check_sat_token(fake_jwt)
+        self.assertFalse(is_valid)
+        self.assertEqual(exp, float(past_exp))
+
+    def test_check_sat_token_malformed(self):
+        is_valid, exp = check_sat_token("not-a-jwt")
+        self.assertFalse(is_valid)
+        self.assertIsNone(exp)
+
+    def test_expired_sat_raises_heb_authentication_error(self):
+        """Verify that attempting an authenticated mutation with expired sat raises HEBAuthenticationError loudly."""
+        client = HEBGraphQLClient()
+        expired_session = SessionState(
+            source="test",
+            cookies={"sat": "expired-token", "sst": "sst-token"},
+            has_sat=True,
+            is_sat_valid=False,
+            sat_expires_at=1792250094.0,
+            has_valid_reese84=True,
+        )
+        with self.assertRaises(HEBAuthenticationError) as ctx:
+            client.execute_persisted_query("cartEstimated", {"userIsLoggedIn": True}, session_state=expired_session)
+        self.assertIn("expired", str(ctx.exception).lower())
+        self.assertIn("boundary", str(ctx.exception).lower())
+
+    @patch("playwright.sync_api.sync_playwright")
+    def test_refresh_session_with_playwright_mock(self, mock_playwright):
+        mock_p_ctx = MagicMock()
+        mock_playwright.return_value.__enter__.return_value = mock_p_ctx
+        mock_browser = MagicMock()
+        mock_context = MagicMock()
+        mock_page = MagicMock()
+
+        mock_p_ctx.chromium.launch.return_value = mock_browser
+        mock_browser.new_context.return_value = mock_context
+        mock_context.new_page.return_value = mock_page
+        future_ms = (time.time() + 3600) * 1000
+        mock_context.storage_state.return_value = {
+            "cookies": [{"name": "reese84", "value": "refreshed_reese", "domain": ".heb.com"}],
+            "origins": [
+                {
+                    "origin": "https://www.heb.com",
+                    "localStorage": [
+                        {"name": "reese84", "value": json.dumps({"renewTime": future_ms, "renewInSec": 850})}
+                    ]
+                }
+            ]
+        }
+        mock_context.cookies.return_value = [{"name": "reese84", "value": "refreshed_reese"}]
+
+        temp_session_file = Path("/tmp/test_playwright_refresh.json")
+        harvester = CDPSessionHarvester(session_path=temp_session_file)
+        try:
+            state = harvester.refresh_session_with_playwright(headless=True, warmup_seconds=0.1)
+            self.assertEqual(state.source, "playwright_refresh")
+            self.assertTrue(state.has_reese84)
+            self.assertTrue(state.has_valid_reese84)
+            self.assertTrue(temp_session_file.exists())
+        finally:
+            if temp_session_file.exists():
+                temp_session_file.unlink()
+
+
 if __name__ == "__main__":
+    import time
     unittest.main()
