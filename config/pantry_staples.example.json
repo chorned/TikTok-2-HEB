@@ -1,0 +1,245 @@
+{
+  "description": "Standard household pantry staples. Items matching these keywords will be bypassed by default unless explicitly requested.",
+  "staples": [
+    {
+      "name": "Kosher salt",
+      "aliases": ["salt", "coarse salt", "sea salt"],
+      "default_heb_query": "H-E-B Coarse Kosher Salt",
+      "category": "spices"
+    },
+    {
+      "name": "Black pepper",
+      "aliases": ["pepper", "ground black pepper", "cracked black pepper"],
+      "default_heb_query": "H-E-B Pure Ground Black Pepper",
+      "category": "spices"
+    },
+    {
+      "name": "Extra virgin olive oil",
+      "aliases": ["olive oil", "evoo"],
+      "default_heb_query": "H-E-B Extra Virgin Olive Oil",
+      "category": "oils"
+    },
+    {
+      "name": "Vegetable oil",
+      "aliases": ["canola oil", "cooking oil", "neutral oil"],
+      "default_heb_query": "H-E-B Vegetable Oil",
+      "category": "oils"
+    },
+    {
+      "name": "Sesame oil",
+      "aliases": ["toasted sesame oil"],
+      "default_heb_query": "H-E-B Toasted Sesame Oil",
+      "category": "oils"
+    },
+    {
+      "name": "Garlic powder",
+      "aliases": ["granulated garlic"],
+      "default_heb_query": "H-E-B Garlic Powder",
+      "category": "spices"
+    },
+    {
+      "name": "Onion powder",
+      "aliases": ["granulated onion"],
+      "default_heb_query": "H-E-B Onion Powder",
+      "category": "spices"
+    },
+    {
+      "name": "Smoked paprika",
+      "aliases": ["paprika", "sweet paprika"],
+      "default_heb_query": "H-E-B Smoked Paprika",
+      "category": "spices"
+    },
+    {
+      "name": "Ground cumin",
+      "aliases": ["cumin"],
+      "default_heb_query": "H-E-B Ground Cumin",
+      "category": "spices"
+    },
+    {
+      "name": "Ground cinnamon",
+      "aliases": ["cinnamon"],
+      "default_heb_query": "H-E-B Ground Cinnamon",
+      "category": "spices"
+    },
+    {
+      "name": "Dried oregano",
+      "aliases": ["oregano"],
+      "default_heb_query": "H-E-B Dried Mexican Oregano",
+      "category": "spices"
+    },
+    {
+      "name": "Dried thyme",
+      "aliases": ["thyme"],
+      "default_heb_query": "H-E-B Dried Thyme Leaves",
+      "category": "spices"
+    },
+    {
+      "name": "Dried rosemary",
+      "aliases": ["rosemary"],
+      "default_heb_query": "H-E-B Whole Dried Rosemary",
+      "category": "spices"
+    },
+    {
+      "name": "Dried basil",
+      "aliases": ["basil leaves"],
+      "default_heb_query": "H-E-B Dried Basil Leaves",
+      "category": "spices"
+    },
+    {
+      "name": "Red pepper flakes",
+      "aliases": ["crushed red pepper", "chili flakes"],
+      "default_heb_query": "H-E-B Crushed Red Pepper",
+      "category": "spices"
+    },
+    {
+      "name": "Cayenne pepper",
+      "aliases": ["cayenne"],
+      "default_heb_query": "H-E-B Ground Cayenne Pepper",
+      "category": "spices"
+    },
+    {
+      "name": "Chili powder",
+      "aliases": ["chilli powder"],
+      "default_heb_query": "H-E-B Chili Powder",
+      "category": "spices"
+    },
+    {
+      "name": "Soy sauce",
+      "aliases": ["reduced sodium soy sauce", "tamari", "shoyu"],
+      "default_heb_query": "H-E-B Reduced Sodium Soy Sauce",
+      "category": "condiments"
+    },
+    {
+      "name": "Fish sauce",
+      "aliases": ["nam pla"],
+      "default_heb_query": "Red Boat Fish Sauce",
+      "category": "condiments"
+    },
+    {
+      "name": "Worcestershire sauce",
+      "aliases": ["worcestershire"],
+      "default_heb_query": "Lea & Perrins Worcestershire Sauce",
+      "category": "condiments"
+    },
+    {
+      "name": "Apple cider vinegar",
+      "aliases": ["acv"],
+      "default_heb_query": "H-E-B Organic Apple Cider Vinegar",
+      "category": "vinegars"
+    },
+    {
+      "name": "White vinegar",
+      "aliases": ["distilled vinegar"],
+      "default_heb_query": "H-E-B Distilled White Vinegar",
+      "category": "vinegars"
+    },
+    {
+      "name": "Rice vinegar",
+      "aliases": ["rice wine vinegar"],
+      "default_heb_query": "Marukan Seasoned Rice Vinegar",
+      "category": "vinegars"
+    },
+    {
+      "name": "Balsamic vinegar",
+      "aliases": ["balsamic"],
+      "default_heb_query": "H-E-B Balsamic Vinegar of Modena",
+      "category": "vinegars"
+    },
+    {
+      "name": "Honey",
+      "aliases": ["clover honey", "raw honey"],
+      "default_heb_query": "H-E-B Pure Clover Honey",
+      "category": "sweeteners"
+    },
+    {
+      "name": "Granulated sugar",
+      "aliases": ["sugar", "white sugar"],
+      "default_heb_query": "H-E-B Pure Cane Sugar",
+      "category": "baking"
+    },
+    {
+      "name": "Brown sugar",
+      "aliases": ["light brown sugar", "dark brown sugar"],
+      "default_heb_query": "H-E-B Pure Cane Light Brown Sugar",
+      "category": "baking"
+    },
+    {
+      "name": "All-purpose flour",
+      "aliases": ["flour", "ap flour"],
+      "default_heb_query": "H-E-B All Purpose Flour",
+      "category": "baking"
+    },
+    {
+      "name": "Cornstarch",
+      "aliases": ["corn starch"],
+      "default_heb_query": "H-E-B Corn Starch",
+      "category": "baking"
+    },
+    {
+      "name": "Baking powder",
+      "aliases": ["double acting baking powder"],
+      "default_heb_query": "H-E-B Double Acting Baking Powder",
+      "category": "baking"
+    },
+    {
+      "name": "Baking soda",
+      "aliases": ["sodium bicarbonate"],
+      "default_heb_query": "Arm & Hammer Pure Baking Soda",
+      "category": "baking"
+    },
+    {
+      "name": "Vanilla extract",
+      "aliases": ["pure vanilla extract", "vanilla"],
+      "default_heb_query": "H-E-B Pure Vanilla Extract",
+      "category": "baking"
+    },
+    {
+      "name": "Dijon mustard",
+      "aliases": ["dijon"],
+      "default_heb_query": "Grey Poupon Dijon Mustard",
+      "category": "condiments"
+    },
+    {
+      "name": "Mayonnaise",
+      "aliases": ["mayo"],
+      "default_heb_query": "Duke's Real Mayonnaise",
+      "category": "condiments"
+    },
+    {
+      "name": "Sriracha",
+      "aliases": ["sriracha hot chili sauce", "hot sauce"],
+      "default_heb_query": "Huy Fong Sriracha Chili Sauce",
+      "category": "condiments"
+    },
+    {
+      "name": "Ketchup",
+      "aliases": ["tomato ketchup"],
+      "default_heb_query": "Heinz Tomato Ketchup",
+      "category": "condiments"
+    },
+    {
+      "name": "Chicken bouillon",
+      "aliases": ["better than bouillon chicken", "chicken broth base", "chicken stock cubes"],
+      "default_heb_query": "Better Than Bouillon Roasted Chicken Base",
+      "category": "broths"
+    },
+    {
+      "name": "Beef bouillon",
+      "aliases": ["better than bouillon beef", "beef broth base"],
+      "default_heb_query": "Better Than Bouillon Roasted Beef Base",
+      "category": "broths"
+    },
+    {
+      "name": "Garlic (fresh head)",
+      "aliases": ["garlic", "garlic cloves"],
+      "default_heb_query": "Fresh Garlic Bulbs",
+      "category": "produce_staples"
+    },
+    {
+      "name": "Butter (unsalted)",
+      "aliases": ["butter", "unsalted butter"],
+      "default_heb_query": "H-E-B Pure Sweet Cream Unsalted Butter",
+      "category": "dairy_staples"
+    }
+  ]
+}

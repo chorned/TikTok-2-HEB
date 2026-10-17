@@ -1,0 +1,46 @@
+# ==============================================================================
+# TikTok-2-HEB Household Configuration Template
+# Copy this file to config/household.yaml and customize for your home.
+# (config/household.yaml is gitignored to protect personal preferences and handles)
+# ==============================================================================
+
+household:
+  # Target servings to scale incoming recipes to (e.g. 2 adults + 1 toddler = 2.5)
+  serving_target: 2.5
+  
+  # Kid friendly spice split: automatically separates capsaicin/heat (sriracha, chili flakes,
+  # jalapeños, cayenne) into post-cook adult garnish and adds safety prep reminders
+  kid_friendly_split: true
+  
+  # Whether to automatically add identified pantry staples to the cart (default: false)
+  auto_add_pantry_staples: false
+
+store:
+  provider: "heb"
+  # Primary H-E-B store ID (e.g. '390' for Austin - S Congress/Oltorf, '425' for Westlake)
+  store_id: "390"
+  
+  # Brand hierarchy for out-of-stock fallback matching
+  brand_hierarchy:
+    - "H-E-B"
+    - "H-E-B Organics"
+    - "Central Market"
+    - "Mi Tienda"
+    - "Hill Country Fare"
+    - "National Brand"
+
+scaling_profile:
+  adults: 2
+  children:
+    - age: 4
+      portion_weight: 0.5
+  discrete_rounding: "ceil_whole_unit" # Round whole items (onions, eggs, avocado) sensibly
+  leftover_buffer_min_scale: 0.65       # Minimum batch scaling factor to prevent pan dry-out
+
+ingress:
+  primary_channel: "imessage"
+  secondary_channel: "slack"
+  authorized_senders:
+    - handle: "default_owner"
+      role: "admin"
+      trigger_mode: "auto_on_video_url"
