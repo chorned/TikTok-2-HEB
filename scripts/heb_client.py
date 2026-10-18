@@ -521,6 +521,38 @@ class HEBClient:
         """
         return self.harvester.harvest(ensure_warmup=ensure_warmup)
 
+    def fetch_buy_it_again_items(
+        self,
+        store_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves frequently purchased / 'Buy It Again' items.
+        """
+        return self.graphql_client.fetch_buy_it_again_items(store_id=store_id or self.store_id, limit=limit)
+
+    def fetch_past_orders(self, page: int = 1) -> List[Dict[str, Any]]:
+        """
+        Retrieves list of past order summaries.
+        """
+        return self.graphql_client.fetch_past_orders(page=page)
+
+    def fetch_order_details(self, order_id: str) -> Dict[str, Any]:
+        """
+        Retrieves full details for a past order via ModifiableOrderDetailsRequest.
+        """
+        return self.graphql_client.fetch_order_details(order_id=order_id)
+
+    def fetch_past_order_items(
+        self,
+        order_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves line items from past order(s).
+        """
+        return self.graphql_client.fetch_past_order_items(order_id=order_id, limit=limit)
+
     # ==========================================================================
     # 4-Tier Out-of-Stock (OOS) Fallback Cascade
     # ==========================================================================

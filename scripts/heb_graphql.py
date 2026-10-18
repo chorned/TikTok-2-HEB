@@ -39,6 +39,8 @@ PERSISTED_QUERIES = {
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
     "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
+    "getBuyItAgainCarousel": "9b25761ca9a712193aa89103789bf34160a3f24546bc8c6ce5ac3367026ce18e",
+    "ModifiableOrderDetailsRequest": "c8e45777b79e4a2a8480b21e921c0c3441e8570b767a9f7af5d71041421a872e",
 }
 
 HEB_GRAPHQL_ENDPOINT = "https://www.heb.com/graphql"
@@ -590,6 +592,332 @@ class HEBGraphQLClient:
             logger.debug(f"Failed to parse __NEXT_DATA__: {ex}")
             return []
 
+    def _normalize_product_item(
+        self,
+        item: Dict[str, Any],
+        default_last_purchased: str = "",
+        default_count: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Normalizes a Product, Carousel item, or OrderItem dict into a standardized item dict:
+        product_id, sku_id, display_name, brand, package_size, price,
+        last_purchased, purchase_count, category, department.
+        """
+        product = item.get("product") if isinstance(item.get("product"), dict) else item
+        product_id = str(product.get("id") or item.get("id") or "").strip()
+
+        display_name = (
+            product.get("fullDisplayName")
+            or product.get("displayName")
+            or item.get("fullDisplayName")
+            or item.get("displayName")
+            or ""
+        )
+
+        brand_raw = product.get("brand") or item.get("brand")
+        if isinstance(brand_raw, dict):
+            brand = brand_raw.get("name") or "H-E-B"
+        elif isinstance(brand_raw, str) and brand_raw.strip():
+            brand = brand_raw.strip()
+        else:
+            if display_name.startswith("H-E-B") or display_name.startswith("HEB"):
+                brand = "H-E-B"
+            elif display_name.startswith("Hill Country Fare") or display_name.startswith("HCF"):
+                brand = "Hill Country Fare"
+            elif display_name.startswith("Central Market"):
+                brand = "Central Market"
+            elif display_name.startswith("Mi Tienda"):
+                brand = "Mi Tienda"
+            else:
+                words = display_name.split()
+                brand = words[0] if words else "H-E-B"
+
+        skus = product.get("SKUs") or item.get("SKUs") or []
+        sku_data = skus[0] if skus and isinstance(skus[0], dict) else {}
+        sku_id = str(sku_data.get("id") or product_id)
+        package_size = sku_data.get("customerFriendlySize") or sku_data.get("size") or ""
+
+        price = 0.0
+        if item.get("totalUnitPrice") and isinstance(item["totalUnitPrice"], dict) and "amount" in item["totalUnitPrice"]:
+            price = float(item["totalUnitPrice"]["amount"] or 0.0)
+        elif item.get("totalLineItemPricePaid") and isinstance(item["totalLineItemPricePaid"], dict) and "amount" in item["totalLineItemPricePaid"]:
+            price = float(item["totalLineItemPricePaid"]["amount"] or 0.0)
+        else:
+            for cp in sku_data.get("contextPrices", []):
+                sp = cp.get("salePrice") or {}
+                lp = cp.get("listPrice") or {}
+                amt = sp.get("amount") or lp.get("amount")
+                if amt is not None:
+                    price = float(amt)
+                    if cp.get("context") in ("CURBSIDE", "CURBSIDE_PICKUP"):
+                        break
+
+        past_info = product.get("pastPurchaseInfo") or item.get("pastPurchaseInfo") or {}
+        last_purchased = (
+            past_info.get("lastPurchaseDate")
+            or past_info.get("onlineLastPurchaseDate")
+            or past_info.get("inStoreLastPurchaseDate")
+            or default_last_purchased
+            or ""
+        )
+
+        purchase_count = int(
+            item.get("fulfilledQuantity")
+            or item.get("quantity")
+            or past_info.get("purchaseCount")
+            or default_count
+        )
+
+        category_obj = product.get("productCategory") or item.get("productCategory") or {}
+        category = category_obj.get("name") if isinstance(category_obj, dict) else str(category_obj or "")
+
+        hierarchy = product.get("fullCategoryHierarchy") or item.get("fullCategoryHierarchy") or ""
+        department = hierarchy.split("/")[0].strip() if hierarchy else category
+
+        return {
+            "product_id": product_id,
+            "sku_id": sku_id,
+            "display_name": display_name,
+            "brand": brand,
+            "package_size": package_size,
+            "price": round(price, 2),
+            "last_purchased": str(last_purchased),
+            "purchase_count": purchase_count,
+            "category": category,
+            "department": department,
+        }
+
+    def fetch_buy_it_again_items(
+        self,
+        store_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves frequently purchased / 'Buy It Again' items.
+        First queries persisted GraphQL query getBuyItAgainCarousel.
+        If more items are needed, augments with authenticated SSR from
+        https://www.heb.com/my-account/your-orders/buy-it-again.
+        Fails loudly if unauthenticated or blocked by WAF.
+        """
+        state = self.get_session()
+        if not state or not state.is_authenticated:
+            raise HEBAuthenticationError(
+                "Active authenticated H-E-B session is required to fetch past orders / 'Buy It Again' items."
+            )
+
+        target_store = store_id or self.store_id or "639"
+        items: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        # Strategy 1: Persisted GraphQL query getBuyItAgainCarousel
+        try:
+            variables = {
+                "storeId": int(target_store),
+                "storeIdString": str(target_store),
+                "shoppingContext": "CURBSIDE_PICKUP",
+                "userIsLoggedIn": True,
+            }
+            res = self.execute_persisted_query("getBuyItAgainCarousel", variables, session_state=state)
+            carousel = res.get("getBuyItAgainCarousel") or {}
+            raw_items = carousel.get("items") or []
+            for raw in raw_items:
+                normalized = self._normalize_product_item(raw)
+                pid = normalized.get("product_id")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    items.append(normalized)
+                    if len(items) >= limit:
+                        return items
+        except (HEBAuthenticationError, HEBWAFChallengeError):
+            raise
+        except Exception as ex:
+            logger.warning(f"getBuyItAgainCarousel query warning: {ex}")
+
+        # Strategy 2: Authenticated SSR /my-account/your-orders/buy-it-again if more items needed
+        if len(items) < limit:
+            try:
+                from curl_cffi import requests as cffi_requests
+                headers = {
+                    "User-Agent": state.user_agent,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+                resp = cffi_requests.get(
+                    "https://www.heb.com/my-account/your-orders/buy-it-again",
+                    headers=headers,
+                    cookies=state.cookies,
+                    impersonate="chrome120",
+                    timeout=15,
+                )
+                if resp.status_code in (401, 403) or "errorCode" in resp.text or "Pardon Our Interruption" in resp.text:
+                    raise HEBWAFChallengeError(
+                        f"Imperva Anti-Bot WAF challenge (HTTP {resp.status_code}) intercepted Buy It Again page."
+                    )
+                if resp.status_code == 200:
+                    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group(1))
+                        layout = data.get("props", {}).get("pageProps", {}).get("layout", {})
+                        comps = layout.get("visualComponents", [])
+                        grid = next((c for c in comps if c.get("type") == "searchGridV2"), None)
+                        if grid:
+                            for raw in grid.get("items", []):
+                                normalized = self._normalize_product_item(raw)
+                                pid = normalized.get("product_id")
+                                if pid and pid not in seen_ids:
+                                    seen_ids.add(pid)
+                                    items.append(normalized)
+                                    if len(items) >= limit:
+                                        break
+            except (HEBAuthenticationError, HEBWAFChallengeError):
+                raise
+            except Exception as ex:
+                logger.warning(f"SSR buy-it-again fallback note: {ex}")
+
+        return items[:limit]
+
+    def fetch_order_details(self, order_id: str) -> Dict[str, Any]:
+        """
+        Retrieves full details for a past order via ModifiableOrderDetailsRequest.
+        Fails loudly if unauthenticated or blocked by WAF.
+        """
+        if not order_id or not str(order_id).strip():
+            raise ValueError("order_id must be a non-empty string.")
+
+        state = self.get_session()
+        if not state or not state.is_authenticated:
+            raise HEBAuthenticationError(
+                "Active authenticated H-E-B session is required to fetch order details."
+            )
+
+        variables = {"orderId": str(order_id).strip()}
+        res = self.execute_persisted_query("ModifiableOrderDetailsRequest", variables, session_state=state)
+        order_details = res.get("orderDetailsRequest", {})
+        if "errors" in order_details and order_details["errors"]:
+            raise HEBGraphQLError(f"Failed to fetch order details for '{order_id}': {order_details['errors']}")
+        return order_details.get("order") or {}
+
+    def fetch_past_orders(self, page: int = 1) -> List[Dict[str, Any]]:
+        """
+        Retrieves list of past order summaries from /my-account/your-orders.
+        Fails loudly if unauthenticated or blocked by WAF.
+        """
+        state = self.get_session()
+        if not state or not state.is_authenticated:
+            raise HEBAuthenticationError(
+                "Active authenticated H-E-B session is required to fetch past orders."
+            )
+
+        url = f"https://www.heb.com/my-account/your-orders?page={page}"
+        headers = {
+            "User-Agent": state.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        try:
+            from curl_cffi import requests as cffi_requests
+            resp = cffi_requests.get(
+                url,
+                headers=headers,
+                cookies=state.cookies,
+                impersonate="chrome120",
+                timeout=15,
+            )
+            if resp.status_code in (401, 403) or "errorCode" in resp.text or "Pardon Our Interruption" in resp.text:
+                raise HEBWAFChallengeError(
+                    f"Imperva Anti-Bot WAF challenge (HTTP {resp.status_code}) intercepted past orders."
+                )
+            if resp.status_code != 200:
+                raise HEBGraphQLError(f"Failed to fetch past orders (HTTP {resp.status_code})")
+
+            match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
+            if not match:
+                raise HEBGraphQLError("Unable to extract __NEXT_DATA__ from past orders page.")
+
+            data = json.loads(match.group(1))
+            orders_raw = data.get("props", {}).get("pageProps", {}).get("orders") or []
+            orders = []
+            for o in orders_raw:
+                orders.append({
+                    "order_id": str(o.get("orderId", "")),
+                    "status": str(o.get("status", "")),
+                    "status_message": str(o.get("orderStatusMessageShort", "")),
+                    "fulfillment_method": str(o.get("fulfillmentMethod", "")),
+                    "store_name": str(o.get("store", {}).get("name", "") if isinstance(o.get("store"), dict) else ""),
+                    "order_date": str((o.get("orderTimeslot") or {}).get("startDateTime") or ""),
+                    "total_price": str((o.get("totalPrice") or {}).get("formattedAmount") or ""),
+                    "product_count": int(o.get("productCount") or 0),
+                })
+            return orders
+        except (HEBAuthenticationError, HEBWAFChallengeError, HEBGraphQLError):
+            raise
+        except Exception as ex:
+            raise HEBGraphQLError(f"Error fetching past orders: {ex}") from ex
+
+    def fetch_past_order_items(
+        self,
+        order_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves line items from past order(s).
+        If order_id is provided, retrieves items for that specific order.
+        If order_id is None, retrieves items across recent past orders up to limit.
+        Fails loudly if unauthenticated or blocked by WAF.
+        """
+        state = self.get_session()
+        if not state or not state.is_authenticated:
+            raise HEBAuthenticationError(
+                "Active authenticated H-E-B session is required to fetch past order items."
+            )
+
+        items: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        if order_id:
+            order = self.fetch_order_details(order_id)
+            order_date = (order.get("orderTimeslot") or {}).get("startDateTime") or ""
+            if not order_date:
+                try:
+                    for o in self.fetch_past_orders(page=1):
+                        if o.get("order_id") == order_id:
+                            order_date = o.get("order_date") or ""
+                            break
+                except Exception:
+                    pass
+            order_items = order.get("orderItems") or []
+            for oi in order_items:
+                normalized = self._normalize_product_item(oi, default_last_purchased=order_date)
+                pid = normalized.get("product_id")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    items.append(normalized)
+                    if len(items) >= limit:
+                        break
+            return items
+
+        # Cross-order aggregation
+        past_orders = self.fetch_past_orders(page=1)
+        for order_summary in past_orders:
+            oid = order_summary.get("order_id")
+            if not oid:
+                continue
+            try:
+                order = self.fetch_order_details(oid)
+                order_date = order_summary.get("order_date") or (order.get("orderTimeslot") or {}).get("startDateTime") or ""
+                order_items = order.get("orderItems") or []
+                for oi in order_items:
+                    normalized = self._normalize_product_item(oi, default_last_purchased=order_date)
+                    pid = normalized.get("product_id")
+                    if pid and pid not in seen_ids:
+                        seen_ids.add(pid)
+                        items.append(normalized)
+                        if len(items) >= limit:
+                            return items
+            except Exception as ex:
+                logger.warning(f"Failed to fetch details for order {oid}: {ex}")
+
+        return items
+
 
 # ==============================================================================
 # Module Helpers
@@ -664,6 +992,47 @@ def product_search_batch(
     return client.product_search_batch(queries=queries, store_id=store_id, limit=limit)
 
 
+def fetch_buy_it_again_items(
+    client: Optional[HEBGraphQLClient] = None,
+    store_id: str = "639",
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Retrieves frequently purchased / 'Buy It Again' items."""
+    c = client or HEBGraphQLClient(store_id=store_id)
+    return c.fetch_buy_it_again_items(store_id=store_id, limit=limit)
+
+
+def fetch_past_orders(
+    client: Optional[HEBGraphQLClient] = None,
+    page: int = 1,
+    store_id: str = "639",
+) -> List[Dict[str, Any]]:
+    """Retrieves list of past order summaries."""
+    c = client or HEBGraphQLClient(store_id=store_id)
+    return c.fetch_past_orders(page=page)
+
+
+def fetch_order_details(
+    order_id: str,
+    client: Optional[HEBGraphQLClient] = None,
+    store_id: str = "639",
+) -> Dict[str, Any]:
+    """Retrieves order details for a specific order ID."""
+    c = client or HEBGraphQLClient(store_id=store_id)
+    return c.fetch_order_details(order_id=order_id)
+
+
+def fetch_past_order_items(
+    order_id: Optional[str] = None,
+    client: Optional[HEBGraphQLClient] = None,
+    limit: int = 50,
+    store_id: str = "639",
+) -> List[Dict[str, Any]]:
+    """Retrieves line items from past orders."""
+    c = client or HEBGraphQLClient(store_id=store_id)
+    return c.fetch_past_order_items(order_id=order_id, limit=limit)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -678,6 +1047,12 @@ if __name__ == "__main__":
     parser.add_argument("--sku", default=None, help="SKU ID (optional)")
     parser.add_argument("--qty", type=int, default=1, help="Quantity (default 1)")
     parser.add_argument("--confirm", action="store_true", help="Confirm execution for cart and coupon mutations")
+    parser.add_argument("--buy-it-again", action="store_true", help="Retrieve frequently purchased / 'Buy It Again' items")
+    parser.add_argument("--past-orders", action="store_true", help="Retrieve list of past orders")
+    parser.add_argument("--order-details", default=None, help="Retrieve order details for specific order ID")
+    parser.add_argument("--past-order-items", action="store_true", help="Retrieve line items from past order(s)")
+    parser.add_argument("--order-id", default=None, help="Specific order ID for --order-details or --past-order-items")
+    parser.add_argument("--limit", type=int, default=50, help="Maximum number of items to retrieve (default 50)")
 
     args = parser.parse_args()
     store = args.store_id or os.environ.get("HEB_STORE_ID", "639")
@@ -729,6 +1104,30 @@ if __name__ == "__main__":
     elif args.search:
         print(f"=== H-E-B Product Search: '{args.search}' ===")
         res = client.product_search(args.search, store_id=store)
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
+
+    elif args.buy_it_again:
+        print(f"=== H-E-B Buy It Again Items (limit={args.limit}) ===")
+        res = client.fetch_buy_it_again_items(store_id=store, limit=args.limit)
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
+
+    elif args.past_orders:
+        print("=== H-E-B Past Orders ===")
+        res = client.fetch_past_orders()
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
+
+    elif args.order_details:
+        print(f"=== H-E-B Order Details: {args.order_details} ===")
+        res = client.fetch_order_details(args.order_details)
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
+
+    elif args.past_order_items:
+        print(f"=== H-E-B Past Order Items (order_id={args.order_id}, limit={args.limit}) ===")
+        res = client.fetch_past_order_items(order_id=args.order_id, limit=args.limit)
         print(json.dumps(res, indent=2))
         sys.exit(0)
 
