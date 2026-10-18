@@ -33,8 +33,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # Persisted Query Hashes discovered from H-E-B's frontend (via texas-grocery-mcp)
 PERSISTED_QUERIES = {
-    "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
-    "cartItemV2": "ade8ec1365c185244d42f9cc4c13997fec4b633ac3c38ff39558df92b210c6d0",
+    "cartEstimated": "2c83f0b9d0c1dc14b4454f73f0dd692afbff44006a96471c79eba43d8d97d7fa",
+    "cartItemV2": "66278b4e6fdbccec5955524e4d0f5867b382400ed4f671a2d43522c0b2424a8f",
     "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
