@@ -127,8 +127,8 @@ class HEBGraphQLClient:
                     "H-E-B authentication session cookies ('sat', 'sst') are missing. "
                     "Login required at https://www.heb.com/my-account/login."
                 )
-            # If reese84 token is expired/missing, attempt 5-second Playwright warm-up
-            if not state.has_valid_reese84:
+            # If reese84 token is completely missing, attempt 5-second Playwright warm-up
+            if not state.has_reese84 and not state.has_valid_reese84:
                 try:
                     refreshed = self.harvester.refresh_session_with_playwright(headless=True, timeout=20000, warmup_seconds=5.0)
                     if refreshed and refreshed.source != "playwright_failed":
@@ -265,11 +265,20 @@ class HEBGraphQLClient:
             qty = item.get("quantity", 1)
 
             price = 0.0
-            price_obj = item.get("price", {}) or {}
-            if isinstance(price_obj, dict) and price_obj.get("amount") is not None:
-                price = float(price_obj["amount"])
-            elif item.get("unitPrice") is not None:
-                price = float(item["unitPrice"])
+            item_price = item.get("itemPrice", {}) or {}
+            if isinstance(item_price, dict):
+                sale_price = item_price.get("salePrice") or {}
+                list_price = item_price.get("listPrice") or {}
+                if isinstance(sale_price, dict) and sale_price.get("amount") is not None:
+                    price = float(sale_price["amount"])
+                elif isinstance(list_price, dict) and list_price.get("amount") is not None:
+                    price = float(list_price["amount"])
+            if price == 0.0:
+                price_obj = item.get("price", {}) or {}
+                if isinstance(price_obj, dict) and price_obj.get("amount") is not None:
+                    price = float(price_obj["amount"])
+                elif item.get("unitPrice") is not None:
+                    price = float(item["unitPrice"])
 
             subtotal += price * qty
             normalized_items.append({
@@ -281,10 +290,18 @@ class HEBGraphQLClient:
                 "package_size": first_sku.get("customerFriendlySize") or item.get("packageSize"),
             })
 
+        cart_price = cart_v2.get("price", {}) or {}
+        cart_subtotal_obj = cart_price.get("subtotal", {}) or {}
+        cart_subtotal = cart_subtotal_obj.get("amount")
+        if cart_subtotal is not None:
+            final_subtotal = float(cart_subtotal)
+        else:
+            final_subtotal = round(subtotal, 2)
+
         return {
             "status": "SUCCESS",
             "item_count": len(normalized_items),
-            "subtotal": round(subtotal, 2),
+            "subtotal": round(final_subtotal, 2),
             "items": normalized_items,
             "raw_cart": cart_v2,
         }
