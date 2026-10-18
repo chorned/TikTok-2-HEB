@@ -11,8 +11,9 @@ config/pantry_staples.json
 !config/pantry_staples.example.json
 
 # Local Cache & State
-cache/
-data/
+cache/*
+!cache/.gitkeep
+*.session.json
 *.session
 cookies.txt
 *.cookies.txt

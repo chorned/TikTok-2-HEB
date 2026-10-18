@@ -7,6 +7,7 @@ Supports catalog search, session cookie integration, and deterministic
 substitutions without cache poisoning.
 """
 
+import math
 import os
 import sys
 import re
@@ -46,6 +47,11 @@ from scripts.cdp_harvester import (
     SessionState,
     get_live_session,
 )
+from scripts.cache_manager import (
+    extract_culinary_info,
+    parse_package_size,
+)
+
 
 
 # Default brand hierarchy
@@ -58,6 +64,144 @@ DEFAULT_BRAND_HIERARCHY = [
     "National Brand",
 ]
 
+VOLUME_CONVERSIONS = {
+    "fl oz": 1.0,
+    "oz": 1.0,
+    "cup": 8.0,
+    "tbsp": 0.5,
+    "tsp": 0.1667,
+    "pt": 16.0,
+    "qt": 32.0,
+    "gal": 128.0,
+    "ml": 1.0 / 29.5735,
+    "l": 33.814,
+}
+
+WEIGHT_CONVERSIONS = {
+    "oz": 1.0,
+    "lb": 16.0,
+    "g": 1.0 / 28.3495,
+    "kg": 35.274,
+}
+
+UNIT_PARSING_RULES = [
+    (r"\b(?:fl(?:uid)?\.?\s*oz\.?|fluid\s+ounces?)\b", "fl oz"),
+    (r"\b(?:oz\.?|ounces?)\b", "oz"),
+    (r"\b(?:lbs?\.?|pounds?)\b", "lb"),
+    (r"\b(?:cups?)\b", "cup"),
+    (r"\b(?:tbsp\.?|tablespoons?)\b", "tbsp"),
+    (r"\b(?:tsp\.?|teaspoons?)\b", "tsp"),
+    (r"\b(?:quarts?|qts?\.?)\b", "qt"),
+    (r"\b(?:pints?|pts?\.?)\b", "pt"),
+    (r"\b(?:gallons?|gals?\.?)\b", "gal"),
+    (r"\b(?:grams?|g\.?)\b", "g"),
+    (r"\b(?:kilograms?|kgs?\.?)\b", "kg"),
+    (r"\b(?:milliliters?|mls?\.?)\b", "ml"),
+    (r"\b(?:liters?|l\.?)\b", "l"),
+    (r"\b(?:count|ct\.?|ea\.?|each|packs?|pks?|bunches|bunch|cloves?|slices?|pieces?|eggs?|bananas?|avocados?)\b", "ct"),
+]
+
+
+def extract_unit_standard(text: str) -> Optional[str]:
+    """Standardizes unit strings into canonical unit keys."""
+    if not text:
+        return None
+    lower = text.lower().strip()
+    for pattern, unit in UNIT_PARSING_RULES:
+        if re.search(pattern, lower):
+            return unit
+    return None
+
+
+def parse_quantity_and_unit(text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Parses strings like '48 oz beef broth', '1 1/2 lbs ground beef', '1/2 gal', 'Avg. 1.25 lbs'.
+    Returns (quantity_float, standardized_unit).
+    """
+    if not text or not isinstance(text, str):
+        return None, None
+
+    clean = text.lower().strip()
+    clean = re.sub(r"^(?:approx\.?|avg\.?|about)\s*", "", clean)
+
+    # 1. Mixed fraction e.g. "1 1/2 lbs"
+    mixed_match = re.match(r"^(\d+)\s+(\d+)/(\d+)\s*([a-zA-Z]+.*)?$", clean)
+    if mixed_match:
+        whole, num, den, rest = mixed_match.groups()
+        try:
+            val = float(whole) + float(num) / float(den)
+            return val, extract_unit_standard(rest)
+        except ZeroDivisionError:
+            pass
+
+    # 2. Simple fraction e.g. "1/2 gal"
+    frac_match = re.match(r"^(\d+)/(\d+)\s*([a-zA-Z]+.*)?$", clean)
+    if frac_match:
+        num, den, rest = frac_match.groups()
+        try:
+            val = float(num) / float(den)
+            return val, extract_unit_standard(rest)
+        except ZeroDivisionError:
+            pass
+
+    # 3. Standard float or integer e.g. "48 oz", "1.25 lbs", "6 eggs"
+    num_match = re.match(r"^([\d\.]+)\s*([a-zA-Z]+.*)?$", clean)
+    if num_match:
+        val_str, rest = num_match.groups()
+        try:
+            val = float(val_str)
+            return val, extract_unit_standard(rest)
+        except ValueError:
+            pass
+
+    return None, None
+
+
+def calculate_package_quantity(
+    requirement_str: str,
+    package_size_str: Optional[str],
+    default_qty: int = 1,
+) -> int:
+    """
+    Calculates the integer package quantity required to fulfill a scaled recipe requirement.
+    Uses ceiling logic (e.g. 48 oz requirement / 32 oz package -> 2 packages).
+    Handles volume, weight, and count unit conversions.
+    """
+    if not package_size_str:
+        return max(1, default_qty)
+
+    req_val, req_unit = parse_quantity_and_unit(requirement_str)
+    pkg_val, pkg_unit = parse_quantity_and_unit(package_size_str)
+
+    if req_val is None or req_val <= 0 or pkg_val is None or pkg_val <= 0:
+        return max(1, default_qty)
+
+    # If both units are identical
+    if req_unit == pkg_unit and req_unit is not None:
+        ratio = req_val / pkg_val
+        return max(1, math.ceil(round(ratio, 4)))
+
+    # Both volume units
+    if req_unit in VOLUME_CONVERSIONS and pkg_unit in VOLUME_CONVERSIONS:
+        req_base = req_val * VOLUME_CONVERSIONS[req_unit]
+        pkg_base = pkg_val * VOLUME_CONVERSIONS[pkg_unit]
+        ratio = req_base / pkg_base
+        return max(1, math.ceil(round(ratio, 4)))
+
+    # Both weight units
+    if req_unit in WEIGHT_CONVERSIONS and pkg_unit in WEIGHT_CONVERSIONS:
+        req_base = req_val * WEIGHT_CONVERSIONS[req_unit]
+        pkg_base = pkg_val * WEIGHT_CONVERSIONS[pkg_unit]
+        ratio = req_base / pkg_base
+        return max(1, math.ceil(round(ratio, 4)))
+
+    # Both count units (or count implicit from plain integer/food item)
+    if (req_unit in ("ct", None)) and (pkg_unit in ("ct", None)):
+        ratio = req_val / pkg_val
+        return max(1, math.ceil(round(ratio, 4)))
+
+    return max(1, default_qty)
+
 
 class HEBClient:
     """Client for H-E-B catalog searching, GraphQL cart/coupon operations, and 4-tier OOS fallback matching."""
@@ -67,10 +211,12 @@ class HEBClient:
         store_id: str = "639",
         brand_hierarchy: Optional[List[str]] = None,
         headless: bool = True,
+        cache_dir: Optional[str] = None,
     ):
         self.store_id = store_id or os.environ.get("HEB_STORE_ID", "639")
         self.brand_hierarchy = brand_hierarchy or DEFAULT_BRAND_HIERARCHY
         self.headless = headless
+        self.cache_dir = Path(cache_dir) if cache_dir else _project_root / "cache"
         self.graphql_client = HEBGraphQLClient(store_id=self.store_id)
         self.harvester = CDPSessionHarvester()
 
@@ -553,6 +699,111 @@ class HEBClient:
         """
         return self.graphql_client.fetch_past_order_items(order_id=order_id, limit=limit)
 
+    def get_preferred_skus(self) -> Dict[str, Any]:
+        """Loads preferred SKUs dictionary from cache/preferred_skus.json."""
+        pref_file = self.cache_dir / "preferred_skus.json"
+        if not pref_file.is_file():
+            return {}
+        try:
+            with open(pref_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("preferred_skus", {})
+        except Exception as e:
+            logger.warning(f"Could not load preferred SKUs from {pref_file}: {e}")
+            return {}
+
+    def find_preferred_sku(
+        self,
+        query_or_ingredient: Any,
+        preferred_map: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Matches an ingredient (ScaledIngredient, dict, or string) against preferred_skus.
+        Checks canonical keys, aliases, and NLP culinary key extraction.
+        Prioritizes manual overrides, then effective weight, then match length.
+        """
+        pref_map = preferred_map if preferred_map is not None else self.get_preferred_skus()
+        if not pref_map:
+            return None
+
+        if hasattr(query_or_ingredient, "model_dump"):
+            ing_dict = query_or_ingredient.model_dump()
+        elif isinstance(query_or_ingredient, dict):
+            ing_dict = query_or_ingredient
+        else:
+            s = str(query_or_ingredient)
+            ing_dict = {"heb_search_query": s, "recipe_requirement": s, "ingredient_key": s}
+
+        ing_key = (ing_dict.get("ingredient_key") or "").replace("_", " ").lower().strip()
+        search_query = (ing_dict.get("heb_search_query") or "").lower().strip()
+        recipe_req = (ing_dict.get("recipe_requirement") or "").lower().strip()
+
+        culinary_key, _ = extract_culinary_info(search_query or recipe_req or ing_key)
+
+        # 1. Direct canonical key lookup
+        for probe in [ing_key, culinary_key, search_query]:
+            if probe and probe in pref_map:
+                return pref_map[probe]
+
+        # 2. Iterate through preferred_skus checking aliases and phrase matches
+        matches = []
+        for ckey, psku in pref_map.items():
+            aliases = [a.lower() for a in psku.get("aliases", [])]
+            all_terms = [ckey] + aliases
+            for term in all_terms:
+                pat = r"\b" + re.escape(term) + r"\b"
+                if (
+                    re.search(pat, ing_key)
+                    or re.search(pat, search_query)
+                    or re.search(pat, recipe_req)
+                    or (culinary_key and culinary_key == term)
+                ):
+                    is_manual = 1 if psku.get("source") == "manual_override" else 0
+                    weight = float(psku.get("effective_weight", 1.0))
+                    matches.append((is_manual, weight, len(term), psku))
+                    break
+
+        if matches:
+            matches.sort(key=lambda m: (m[0], m[1], m[2]), reverse=True)
+            return matches[0][3]
+
+        return None
+
+    def stage_ingredient(
+        self,
+        ingredient: Any,
+        store_id: Optional[str] = None,
+        confirm: bool = False,
+        preferred_skus_cache: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resolves an ingredient (recipe ingredient or ad-hoc addition) through Tier-0 preferred
+        SKU matching and the 4-tier OOS cascade, staging the resolved SKU into the live H-E-B cart.
+        Requires confirm=True to execute cart addition.
+        """
+        match = self.match_ingredient_to_sku(
+            ingredient,
+            store_id=store_id,
+            preferred_skus_cache=preferred_skus_cache,
+        )
+        if match.get("status") in ("SUCCESS", "SUBSTITUTED") and match.get("sku"):
+            sku_info = match["sku"]
+            cart_resp = self.cart_add(
+                product_id=sku_info["heb_product_id"],
+                sku_id=sku_info.get("sku_id"),
+                quantity=sku_info.get("quantity_to_order", 1),
+                confirm=confirm,
+            )
+            return {
+                "match": match,
+                "cart_response": cart_resp,
+            }
+        return {
+            "match": match,
+            "cart_response": None,
+            "error": match.get("reason", "Could not resolve SKU for ingredient"),
+        }
+
     # ==========================================================================
     # 4-Tier Out-of-Stock (OOS) Fallback Cascade
     # ==========================================================================
@@ -562,9 +813,11 @@ class HEBClient:
         ingredient: Any,  # ScaledIngredient or dict
         store_id: Optional[str] = None,
         candidate_pool: Optional[List[Dict[str, Any]]] = None,
+        preferred_skus_cache: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the 4-Tier Out-of-Stock Fallback Cascade:
+          - Tier 0: Preferred SKU match (from cache/preferred_skus.json with package size scaling).
           - Tier 1: Exact SKU match (primary_sku if known and in stock).
           - Tier 2: Brand substitution (walks store.brand_hierarchy).
           - Tier 3: Organic <-> Conventional swap.
@@ -588,8 +841,88 @@ class HEBClient:
         req_text = (ing_dict.get("recipe_requirement") or query).lower()
         wants_organic = "organic" in req_text
 
+        # -------------------------------------------------------------
+        # Tier 0: Preferred SKU Match (from cache/preferred_skus.json)
+        # -------------------------------------------------------------
+        pref_map = preferred_skus_cache if preferred_skus_cache is not None else self.get_preferred_skus()
+        preferred_match = self.find_preferred_sku(ing_dict, pref_map) if pref_map else None
+
+        candidates = None
+
+        if preferred_match:
+            pref_pid = str(preferred_match.get("product_id") or "")
+            pref_sku_id = str(preferred_match.get("sku_id") or "")
+            in_stock = False
+            matched_item = None
+
+            if candidate_pool is not None:
+                # Explicit candidate pool provided (testing / pre-fetched)
+                for c in candidate_pool:
+                    cid = str(c.get("product_id") or "")
+                    csku = str(c.get("sku_id") or "")
+                    if (pref_pid and cid == pref_pid) or (pref_sku_id and csku == pref_sku_id):
+                        matched_item = c
+                        in_stock = bool(c.get("in_stock", True))
+                        break
+            else:
+                # Live search
+                candidates = self.search_heb_product(query, active_store)
+                for c in candidates:
+                    cid = str(c.get("product_id") or "")
+                    csku = str(c.get("sku_id") or "")
+                    if (pref_pid and cid == pref_pid) or (pref_sku_id and csku == pref_sku_id):
+                        matched_item = c
+                        in_stock = bool(c.get("in_stock", True))
+                        break
+
+                if not matched_item and pref_pid:
+                    try:
+                        direct_results = self.search_heb_product(pref_pid, active_store)
+                        for c in direct_results:
+                            if str(c.get("product_id") or "") == pref_pid:
+                                matched_item = c
+                                in_stock = bool(c.get("in_stock", True))
+                                break
+                    except Exception as ex:
+                        logger.debug(f"Direct lookup for preferred SKU {pref_pid} failed: {ex}")
+
+            if in_stock:
+                pkg_size = (matched_item.get("package_size") if matched_item else None) or preferred_match.get("package_size")
+                default_qty = primary_sku.get("quantity_to_order", 1) if primary_sku else 1
+                qty = calculate_package_quantity(
+                    requirement_str=req_text,
+                    package_size_str=pkg_size,
+                    default_qty=default_qty,
+                )
+                display_name = (matched_item.get("name") if matched_item else None) or preferred_match.get("display_name") or preferred_match.get("name") or "Preferred Product"
+                price = (matched_item.get("price") if matched_item else None) or preferred_match.get("price")
+
+                pool_for_fallbacks = candidate_pool if candidate_pool is not None else (candidates or [])
+                return {
+                    "status": "SUCCESS",
+                    "tier": 0,
+                    "reason": f"Tier 0: Preferred SKU match ({preferred_match.get('brand', 'H-E-B')})",
+                    "sku": {
+                        "heb_product_id": pref_pid,
+                        "sku_id": pref_sku_id or pref_pid,
+                        "heb_product_name": display_name,
+                        "package_size": pkg_size,
+                        "price": price,
+                        "quantity_to_order": qty,
+                        "reason": f"Tier 0: Preferred SKU match (source: {preferred_match.get('source', 'past_orders')})",
+                    },
+                    "fallback_skus": self._format_fallbacks(pool_for_fallbacks, exclude_id=pref_pid),
+                    "needs_human_call": False,
+                }
+            else:
+                logger.info(
+                    f"Tier-0 Preferred SKU '{preferred_match.get('display_name')}' ({pref_pid}) is out of stock; "
+                    "falling back smoothly to Tier-1 brand hierarchy search."
+                )
+
         # Fetch candidate products if not provided
-        candidates = candidate_pool if candidate_pool is not None else self.search_heb_product(query, active_store)
+        if candidates is None:
+            candidates = candidate_pool if candidate_pool is not None else self.search_heb_product(query, active_store)
 
         if not candidates:
             return {
@@ -759,10 +1092,45 @@ def search_heb_product(query: str, store_id: str = "639") -> List[Dict[str, Any]
     return client.search_heb_product(query, store_id=store_id)
 
 
-def match_ingredient_to_sku(ingredient: Any, store_id: str = "639") -> Dict[str, Any]:
-    """Clean module-level helper function for 4-tier OOS fallback matching."""
+def match_ingredient_to_sku(
+    ingredient: Any,
+    store_id: str = "639",
+    candidate_pool: Optional[List[Dict[str, Any]]] = None,
+    preferred_skus_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Clean module-level helper function for Out-of-Stock fallback matching."""
     client = HEBClient(store_id=store_id)
-    return client.match_ingredient_to_sku(ingredient, store_id=store_id)
+    return client.match_ingredient_to_sku(
+        ingredient,
+        store_id=store_id,
+        candidate_pool=candidate_pool,
+        preferred_skus_cache=preferred_skus_cache,
+    )
+
+
+def find_preferred_sku(
+    query_or_ingredient: Any,
+    cache_dir: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Clean module-level helper function for looking up preferred SKUs."""
+    client = HEBClient(cache_dir=cache_dir)
+    return client.find_preferred_sku(query_or_ingredient)
+
+
+def stage_ingredient(
+    ingredient: Any,
+    confirm: bool = False,
+    store_id: str = "639",
+    preferred_skus_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Clean module-level helper function to resolve and stage an ingredient."""
+    client = HEBClient(store_id=store_id)
+    return client.stage_ingredient(
+        ingredient=ingredient,
+        confirm=confirm,
+        store_id=store_id,
+        preferred_skus_cache=preferred_skus_cache,
+    )
 
 
 def warm_up_session(store_id: Optional[str] = None) -> Dict[str, Any]:
@@ -852,6 +1220,8 @@ if __name__ == "__main__":
     parser.add_argument("query", nargs="?", default=None, help="Ingredient or product search term (optional)")
     parser.add_argument("--store-id", default=None, help="H-E-B store ID (defaults to HEB_STORE_ID or 639)")
     parser.add_argument("--tier-test", action="store_true", help="Simulate 4-tier cascade test")
+    parser.add_argument("--resolve-sku", default=None, help="Resolve an ingredient through Tier-0 and OOS cascade")
+    parser.add_argument("--stage-sku", default=None, help="Resolve and stage an ingredient into the H-E-B cart")
     parser.add_argument("--warmup", action="store_true", help="Perform live Playwright session warm-up and 2FA check")
     parser.add_argument("--submit-code", default=None, help="Submit 6-digit 2FA verification code to active Chrome session")
     parser.add_argument("--harvest", action="store_true", help="Harvest live session cookies from Chrome CDP (9222) / rookiepy")
@@ -868,6 +1238,18 @@ if __name__ == "__main__":
 
     effective_store = args.store_id or os.environ.get("HEB_STORE_ID", "639")
     client = HEBClient(store_id=effective_store)
+
+    if args.resolve_sku:
+        print(f"=== Resolving SKU for '{args.resolve_sku}' ===")
+        match = client.match_ingredient_to_sku(args.resolve_sku, store_id=effective_store)
+        print(json.dumps(match, indent=2))
+        sys.exit(0)
+
+    if args.stage_sku:
+        print(f"=== Staging SKU for '{args.stage_sku}' (confirm={args.confirm}) ===")
+        stage_res = client.stage_ingredient(args.stage_sku, store_id=effective_store, confirm=args.confirm)
+        print(json.dumps(stage_res, indent=2))
+        sys.exit(0)
 
     if args.submit_code:
         print("=== Submitting 2FA Verification Code to Real Chrome ===")
@@ -960,5 +1342,6 @@ if __name__ == "__main__":
             "message": str(err)
         }, indent=2), file=sys.stderr)
         sys.exit(1)
+
 
 

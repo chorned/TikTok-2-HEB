@@ -25,18 +25,19 @@ flowchart TD
     E --> F["🧂 Pantry Comparator<br>(config/pantry_staples.json)"]
     F --> G["💾 Standalone YAML Cache<br>(cache/recipes/<slug>.yaml)"]
     
-    G --> H["🛒 4-Tier Out-of-Stock Cascade<br>(scripts/heb_client.py)"]
+    G --> H["🛒 5-Tier Fallback Cascade<br>(scripts/heb_client.py)"]
     
-    subgraph OOS_Cascade ["4-Tier Out-of-Stock Fallback Engine"]
+    subgraph OOS_Cascade ["5-Tier Out-of-Stock Fallback Engine"]
+        T0["Tier 0: Preferred SKU Match & Sizing Math<br>(cache/preferred_skus.json)"]
         T1["Tier 1: Exact Primary SKU Match"]
         T2["Tier 2: Brand Hierarchy Substitution<br>(H-E-B → CM → Hill Country Fare)"]
         T3["Tier 3: Organic ↔ Conventional Swap"]
         T4["Tier 4: Package Size Math / Human Escalation"]
-        T1 --> T2 --> T3 --> T4
+        T0 --> T1 --> T2 --> T3 --> T4
     end
     
     H --> OOS_Cascade
-    OOS_Cascade --> I["🛍️ H-E-B Cart Staging<br>(Playwright Headless / MCP)"]
+    OOS_Cascade --> I["🛍️ H-E-B Cart Staging<br>(Playwright Headless / GraphQL)"]
     I --> J["📱 Mobile Review Summary (iMessage / Slack)<br>Hard Human-in-the-Loop Checkout Gate"]
 ```
 
@@ -51,12 +52,13 @@ flowchart TD
   2. *Pass 2:* Smart subtitle cleaner stripping timestamps, styling tags, and rolling caption duplicates.
   3. *Pass 3:* Heuristic fallback downloading high-efficiency MP3 audio or 0.5 fps video keyframes for silent or music-overlaid videos.
 
-### 2. 🛡️ 4-Tier Out-of-Stock (OOS) Cascade (Anti-Cache-Poisoning)
-When items are unavailable at your pinned H-E-B store, the fallback engine walks a deterministic brand hierarchy without corrupting original recipe preferences:
+### 2. 🛡️ 5-Tier Fallback Cascade with Tier-0 Preferred SKUs (Anti-Cache-Poisoning)
+When items are processed for recipe staging or ad-hoc requests, the fallback engine walks a deterministic hierarchy without corrupting original recipe preferences:
+- **Tier 0 (Preferred SKU & Sizing Math):** Resolves canonical food keys against `cache/preferred_skus.json` (populated from past orders and manual pins). Calculates package quantity using ceiling volume/weight/count math (e.g. 48 oz requirement / 32 oz package -> 2 packages).
 - **Tier 1 (Exact SKU):** Adds known primary SKU if in stock.
 - **Tier 2 (Brand Hierarchy):** Matches equivalent product walking `H-E-B` → `H-E-B Organics` → `Central Market` → `Mi Tienda` → `Hill Country Fare` → `National Brand`.
 - **Tier 3 (Organic ↔ Conventional Swap):** Fulfills organic orders with conventional or vice-versa when single-tier stockouts occur.
-- **Tier 4 (Package Size Adjustment & Escalation):** Adjusts ordering quantities (e.g. 2x 8 oz bags if 16 oz is OOS) or flags category wipeouts as `⚠️ OUT OF STOCK (NEEDS HUMAN CALL)`.
+- **Tier 4 (Package Size Adjustment & Escalation):** Adjusts ordering quantities or flags category wipeouts as `⚠️ OUT OF STOCK (NEEDS HUMAN CALL)`.
 - *Invariant:* Temporary substitutions **never** overwrite `primary_sku` in the recipe cache unless explicitly instructed by a human.
 
 ### 3. 👶 Household Scaler & Kid-Friendly Split
@@ -145,7 +147,7 @@ python scripts/extract_recipe_media.py "https://www.tiktok.com/@creator/video/73
 
 Outputs clean metadata, parsed subtitles, and transcription tokens in JSON format.
 
-### 2. Recipe Cache Operations
+### 2. Recipe Cache & Preferred SKU Operations
 ```bash
 # Lookup an existing recipe by video ID, URL, or slug
 python scripts/cache_manager.py lookup --query "73491829104"
@@ -153,7 +155,18 @@ python scripts/cache_manager.py lookup --query "73491829104"
 # Save or update a structured recipe YAML file
 python scripts/cache_manager.py save --file sample_recipe.yaml
 
-# Permanently promote a user-selected substitution to primary SKU
+# Sync preferred SKUs from past orders & Buy It Again (recency-weighted)
+python scripts/cache_manager.py update-preferred-skus
+
+# Manually pin a preferred SKU override
+python scripts/cache_manager.py pin-preferred-sku \
+  --ingredient "whole milk" \
+  --sku "4122012345" \
+  --product "123456" \
+  --name "H-E-B Organics Whole Milk" \
+  --package-size "1 gal"
+
+# Permanently promote a user-selected substitution to primary SKU and pin preferred SKU
 python scripts/cache_manager.py promote-sku \
   --recipe-id "crispy-honey-garlic-salmon" \
   --ingredient-key "salmon_fillet" \
@@ -162,13 +175,19 @@ python scripts/cache_manager.py promote-sku \
   --qty 1
 ```
 
-### 3. Test H-E-B Catalog Search & OOS Cascade
+### 3. Test H-E-B Catalog Search, Tier-0 Resolution & OOS Cascade
 ```bash
 # Search H-E-B store catalog
 python scripts/heb_client.py "Atlantic Salmon" --store-id 390
 
-# Test 4-Tier Out-of-Stock Fallback Cascade on an ingredient
+# Test 5-Tier Fallback Cascade on an ingredient
 python scripts/heb_client.py "Atlantic Salmon" --tier-test
+
+# Resolve an ingredient or ad-hoc query with package size math
+python scripts/heb_client.py --resolve-sku "48 oz beef broth"
+
+# Stage an ingredient into the live H-E-B cart (requires human-in-the-loop --confirm)
+python scripts/heb_client.py --stage-sku "48 oz beef broth" --confirm
 ```
 
 ---
@@ -223,13 +242,23 @@ TikTok-2-HEB/
 │   └── pantry_staples.json           # [GITIGNORED] Local pantry bypass list
 ├── scripts/
 │   ├── extract_recipe_media.py       # 3-Pass zero-auth multimodal media extractor
-│   ├── cache_manager.py              # Pydantic models, pantry comparator, YAML database
-│   └── heb_client.py                 # H-E-B product search & 4-tier OOS fallback engine
-├── cache/                            # [GITIGNORED] Local media & recipe database
+│   ├── cache_manager.py              # Pydantic models, pantry comparator, YAML & preferred SKUs engine
+│   ├── cdp_harvester.py              # Chrome CDP session & cookie harvester
+│   ├── heb_client.py                 # H-E-B product search & 5-tier OOS fallback engine
+│   └── heb_graphql.py                # Authenticated SSR extraction & GraphQL client
+├── cache/                            # [GITIGNORED] Local media, session & recipe database
+│   ├── .gitkeep                      # Preserves directory structure across clean git clones
+│   ├── heb_session.json              # Harvested WAF/Bearer session tokens
+│   ├── index.json                    # Fast lookup index for cached recipes
+│   ├── preferred_skus.json           # Time-decay ranked past orders & manual pins
 │   ├── media/                        # Temporary audio tracks & extracted video keyframes
 │   └── recipes/                      # Persistent recipe YAML database
 └── tests/
     ├── test_core_modules.py          # Unit tests for extractor, cache, and cascade
+    ├── test_heb_client.py            # Unit tests for Tier-0 resolution and package sizing math
+    ├── test_heb_graphql.py           # Unit tests for GraphQL client, WAF, and SSR parsing
+    ├── test_past_orders.py           # Unit tests for past order and buy-it-again queries
+    ├── test_preferred_skus.py        # Unit tests for preferred SKUs decay and culinary normalization
     └── test_skill_setup.py           # Unified diagnostic & setup verification test
 ```
 

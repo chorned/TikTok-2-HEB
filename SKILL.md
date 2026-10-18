@@ -63,13 +63,14 @@ python scripts/extract_recipe_media.py "<VIDEO_URL>"
 2. **Pantry Deduplication:** Check ingredients against `config/pantry_staples.json` using `PantryComparator`. Move matching items (salt, pepper, cooking oil, soy sauce, garlic powder) to `pantry_staples_skipped`.
 3. **Kid Prep Reminders:** Generate kid-friendly adaptations if spicy ingredients or whole proteins are detected.
 
-### Step 4: H-E-B Catalog Matching & 4-Tier Out-of-Stock Cascade
-For each ingredient in `ingredients_to_buy`, match against the local H-E-B store catalog using `scripts/heb_client.py`:
+### Step 4: H-E-B Catalog Matching & 5-Tier Fallback Cascade
+For each ingredient in `ingredients_to_buy` (or ad-hoc user requests), match against the local H-E-B store catalog using `scripts/heb_client.py`:
 
-- **Tier 1 (Exact SKU Match):** Add existing primary SKU if in stock.
+- **Tier 0 (Preferred SKU Resolution & Package Size Scaling):** Matches against `cache/preferred_skus.json` (canonical keys and alias arrays) populated from past orders and manual pins. Automatically calculates integer package quantities (e.g. 48 oz recipe volume / 32 oz package -> 2 packages). If in stock, stages directly as Tier 0. If out of stock, smoothly cascades to Tier 1.
+- **Tier 1 (Exact SKU Match):** Add existing recipe primary SKU if in stock.
 - **Tier 2 (Brand Hierarchy):** If primary is OOS, substitute using `brand_hierarchy` (`H-E-B` → `H-E-B Organics` → `Central Market` → `Mi Tienda` → `Hill Country Fare` → `National Brand`).
 - **Tier 3 (Organic ↔ Conventional Swap):** Swap organic for conventional (or vice-versa) if store has only one in stock.
-- **Tier 4 (Package Size Adjustment / Human Escalation):** Adjust quantities (e.g. 2x 8 oz for 1x 16 oz) or flag category wipeout as `⚠️ OUT OF STOCK (NEEDS HUMAN CALL)`.
+- **Tier 4 (Package Size Adjustment / Human Escalation):** Adjust quantities or flag category wipeout as `⚠️ OUT OF STOCK (NEEDS HUMAN CALL)`.
 
 ### Step 5: Direct GraphQL Cart Staging & Coupon Clipping (Zero Slow UI Clicks)
 Stage items and clip coupons directly via authenticated GraphQL operations (persisted queries `cartEstimated`, `cartItemV2`, `CouponClip` vendored from `texas-grocery-mcp`) using harvested Chrome CDP (`127.0.0.1:9222`) / `rookiepy` session tokens:
@@ -78,16 +79,32 @@ Stage items and clip coupons directly via authenticated GraphQL operations (pers
 # 1. Harvest or refresh live session tokens
 python scripts/heb_client.py --harvest
 
-# 2. Inspect current live cart
-python scripts/heb_client.py --cart-get
+# 2. Sync preferred SKUs from past orders & Buy It Again
+python scripts/cache_manager.py update-preferred-skus
 
-# 3. Stage candidate items (requires human-in-the-loop --confirm)
+# 3. Manually pin a favorite product as preferred SKU (protected from auto-sync)
+python scripts/cache_manager.py pin-preferred-sku \
+  --ingredient "whole milk" \
+  --sku "4122012345" \
+  --product "123456" \
+  --name "H-E-B Organics Whole Milk" \
+  --package-size "1 gal"
+
+# 4. Resolve an ad-hoc ingredient or test package sizing
+python scripts/heb_client.py --resolve-sku "48 oz beef broth"
+
+# 5. Stage candidate items (requires human-in-the-loop --confirm)
+python scripts/heb_client.py --stage-sku "48 oz beef broth" --confirm
+# or directly by product ID:
 python scripts/heb_client.py --cart-add <PRODUCT_ID> [--sku <SKU_ID>] [--qty <N>] --confirm
 
-# 4. Remove item from cart if swapped
+# 6. Inspect current live cart
+python scripts/heb_client.py --cart-get
+
+# 7. Remove item from cart if swapped
 python scripts/heb_client.py --cart-remove <PRODUCT_ID> [--sku <SKU_ID>] --confirm
 
-# 5. Clip digital coupons
+# 8. Clip digital coupons
 python scripts/heb_client.py --coupon-clip <COUPON_ID> --confirm
 ```
 
@@ -138,12 +155,12 @@ Reply if you want to add a pantry item (e.g. "add soy sauce") or swap a brand. O
 
 When the user replies to the staged review thread:
 1. **"Add [pantry item]"** (e.g. *"we are out of soy sauce, add it"*):
-   - Search H-E-B for the staple.
-   - Stage the SKU in the cart.
+   - Resolve through Tier-0 preferred SKU engine and stage in cart:
+     `python scripts/heb_client.py --stage-sku "soy sauce" --confirm`
    - Confirm via brief reply: *"Added 1x H-E-B Reduced Sodium Soy Sauce to your cart."*
 2. **"Swap [item] for [preference]"** (e.g. *"swap regular salmon for wild sockeye"*):
    - Remove old SKU from cart and add preferred SKU.
    - Prompt: *"Swapped for wild sockeye for this order. Would you like me to make this swap permanent for future orders of this recipe?"*
 3. **"Make that swap permanent"**:
-   - Execute `python scripts/cache_manager.py promote-sku ...` to update `primary_sku` in `cache/recipes/<slug>.yaml`.
-   - Confirm: *"Updated recipe cache: Central Market Wild Sockeye is now your primary SKU for this recipe."*
+   - Execute `python scripts/cache_manager.py promote-sku ...` to update `primary_sku` in `cache/recipes/<slug>.yaml` and pin it in `cache/preferred_skus.json` with `source: "manual_override"`.
+   - Confirm: *"Updated recipe cache: Central Market Wild Sockeye is now your primary SKU for this recipe and pinned as your preferred SKU."*

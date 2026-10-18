@@ -175,18 +175,26 @@ class TestSkillSetupAndDiagnostics(unittest.TestCase):
                 self.assertGreaterEqual(len(pdata["staples"]), 10, "pantry list must have valid items")
 
     # --------------------------------------------------------------------------
-    # 5. Cache Directory Structure
+    # 5. Cache Directory Structure & Portability
     # --------------------------------------------------------------------------
     def test_05_cache_directories(self):
-        """Verify cache/media and cache/recipes directories exist."""
-        media_dir = PROJECT_ROOT / "cache" / "media"
-        recipes_dir = PROJECT_ROOT / "cache" / "recipes"
+        """Verify unified cache structure exists and is git-portable."""
+        cache_dir = PROJECT_ROOT / "cache"
+        media_dir = cache_dir / "media"
+        recipes_dir = cache_dir / "recipes"
+        gitkeep = cache_dir / ".gitkeep"
 
+        cache_dir.mkdir(parents=True, exist_ok=True)
         media_dir.mkdir(parents=True, exist_ok=True)
         recipes_dir.mkdir(parents=True, exist_ok=True)
 
+        if not gitkeep.exists():
+            gitkeep.touch()
+
+        self.assertTrue(cache_dir.is_dir(), "cache/ root directory must exist")
         self.assertTrue(media_dir.is_dir(), "cache/media directory must exist")
         self.assertTrue(recipes_dir.is_dir(), "cache/recipes directory must exist")
+        self.assertTrue(gitkeep.exists(), "cache/.gitkeep must exist for clean repository clones")
 
     # --------------------------------------------------------------------------
     # 6. Playwright Browser Diagnostics
@@ -223,19 +231,34 @@ class TestSkillSetupAndDiagnostics(unittest.TestCase):
         self.assertAlmostEqual(factor, 0.65, places=2)
         self.assertTrue(scaler.is_kid_sensitive("sriracha hot sauce"))
 
-        # C. HEB 4-Tier Fallback Cascade
+        # C. HEB Tier-0 Preferred SKU Resolution & OOS Cascade
         client = HEBClient(store_id="639")
+        sample_pref = {
+            "salmon": {
+                "canonical_key": "salmon",
+                "aliases": ["salmon", "atlantic salmon"],
+                "product_id": "319482",
+                "sku_id": "319482001",
+                "display_name": "H-E-B Fresh Atlantic Salmon Fillet",
+                "brand": "H-E-B",
+                "package_size": "1.25 lb",
+                "source": "past_orders",
+            }
+        }
         ing = ScaledIngredient(
             ingredient_key="salmon",
-            recipe_requirement="1.25 lbs Atlantic Salmon",
+            recipe_requirement="2.5 lbs Atlantic Salmon",
             heb_search_query="Atlantic Salmon",
         )
         sample_pool = [
-            {"product_id": "319482", "name": "H-E-B Fresh Atlantic Salmon Fillet", "brand": "H-E-B", "price": 11.98, "in_stock": True, "package_size": "~1.25 lb tray"}
+            {"product_id": "319482", "sku_id": "319482001", "name": "H-E-B Fresh Atlantic Salmon Fillet", "brand": "H-E-B", "price": 11.98, "in_stock": True, "package_size": "1.25 lb"}
         ]
-        match = client.match_ingredient_to_sku(ing, candidate_pool=sample_pool)
-        self.assertIn(match["status"], ["SUCCESS", "SUBSTITUTED"])
-        self.assertIn("sku", match)
+        match = client.match_ingredient_to_sku(ing, candidate_pool=sample_pool, preferred_skus_cache=sample_pref)
+        self.assertEqual(match["tier"], 0)
+        self.assertEqual(match["status"], "SUCCESS")
+        self.assertEqual(match["sku"]["heb_product_id"], "319482")
+        # 2.5 lbs required / 1.25 lb package = 2 packages
+        self.assertEqual(match["sku"]["quantity_to_order"], 2)
 
         # D. Cache CRUD dry-run in temporary directory
         with tempfile.TemporaryDirectory() as tmp_dir:
