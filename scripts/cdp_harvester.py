@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import time
+import struct
 import logging
 from dataclasses import dataclass, field
 import base64
@@ -23,6 +24,102 @@ from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("cdp_harvester")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+MAC_EPOCH = 978307200.0  # Unix timestamp for Jan 1 2001 00:00:00 UTC (macOS Cocoa epoch)
+
+
+def parse_safari_binarycookies(
+    filepath: Optional[Path] = None,
+    domains: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Parses macOS Safari binarycookies file (Cookies.binarycookies) directly in Python.
+    Bypasses rookiepy/rookie-rs C-string null-terminator parsing panics on macOS.
+    Returns normalized cookie dictionaries compatible with Playwright and CookieJar.
+    """
+    paths = []
+    if filepath:
+        paths.append(Path(filepath))
+    else:
+        paths.extend([
+            Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+            Path.home() / "Library/Cookies/Cookies.binarycookies",
+        ])
+
+    target = next((p for p in paths if p.is_file()), None)
+    if not target:
+        return []
+
+    try:
+        data = target.read_bytes()
+    except Exception as ex:
+        logger.debug(f"Could not read Safari binarycookies at {target}: {ex}")
+        return []
+
+    if len(data) < 8 or data[:4] != b"cook":
+        return []
+
+    try:
+        num_pages = struct.unpack(">I", data[4:8])[0]
+        if len(data) < 8 + 4 * num_pages:
+            return []
+        page_sizes = [struct.unpack(">I", data[8 + 4 * i : 12 + 4 * i])[0] for i in range(num_pages)]
+        pos = 8 + 4 * num_pages
+        cookies: List[Dict[str, Any]] = []
+
+        for size in page_sizes:
+            page_data = data[pos : pos + size]
+            pos += size
+            if len(page_data) < 8:
+                continue
+            page_magic = struct.unpack(">I", page_data[:4])[0]
+            num_cookies = struct.unpack("<I", page_data[4:8])[0]
+            if page_magic != 0x00000100 or len(page_data) < 8 + 4 * num_cookies:
+                continue
+            cookie_offsets = [struct.unpack("<I", page_data[8 + 4 * i : 12 + 4 * i])[0] for i in range(num_cookies)]
+
+            for c_off in cookie_offsets:
+                if c_off >= len(page_data):
+                    continue
+                c_data = page_data[c_off:]
+                if len(c_data) < 48:
+                    continue
+                c_size, _, flags, _ = struct.unpack("<IIII", c_data[:16])
+                url_off, name_off, path_off, val_off = struct.unpack("<IIII", c_data[16:32])
+
+                def read_str(offset: int) -> str:
+                    if offset >= len(c_data):
+                        return ""
+                    end = c_data.find(b"\x00", offset)
+                    if end == -1:
+                        return c_data[offset:].decode("utf-8", errors="replace")
+                    return c_data[offset:end].decode("utf-8", errors="replace")
+
+                domain = read_str(url_off)
+                name = read_str(name_off)
+                path = read_str(path_off) or "/"
+                val = read_str(val_off)
+
+                if domains and not any(d in domain for d in domains):
+                    continue
+
+                expiry_mac = struct.unpack("<d", c_data[40:48])[0]
+                expiry_unix = expiry_mac + MAC_EPOCH
+
+                cookies.append({
+                    "name": name,
+                    "value": val,
+                    "domain": domain,
+                    "path": path,
+                    "secure": bool(flags & 1),
+                    "httpOnly": bool(flags & 4),
+                    "expires": expiry_unix,
+                })
+        return cookies
+    except Exception as ex:
+        logger.debug(f"Safari binarycookies parsing note: {ex}")
+        return []
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SESSION_FILE = PROJECT_ROOT / "cache" / "heb_session.json"
@@ -171,7 +268,7 @@ class CDPSessionHarvester:
         # 2. Fallback to local Chrome cookie extraction via rookiepy
         rookie_state = self._harvest_from_rookiepy()
         if rookie_state:
-            logger.info(f"Harvested {len(rookie_state.cookies)} cookies via rookiepy from local Chrome.")
+            logger.info(f"Harvested {len(rookie_state.cookies)} cookies via {rookie_state.source} from local browser.")
             self._persist_cookies(rookie_state.raw_cookies)
             if refresh_if_needed and not rookie_state.has_valid_reese84:
                 refreshed = self.refresh_session_with_playwright(headless=True, timeout=20000, warmup_seconds=5.0)
@@ -386,18 +483,105 @@ class CDPSessionHarvester:
             logger.debug(f"CDP harvesting note: {ex}")
             return None
 
-    def _harvest_from_rookiepy(self) -> Optional[SessionState]:
-        """Harvests cookies from local Google Chrome database using rookiepy."""
+    def _harvest_safari_cookies(self, domains: List[str]) -> List[Dict[str, Any]]:
+        """Extracts cookies from Safari binarycookies, falling back to rookiepy.safari."""
+        cookies = parse_safari_binarycookies(domains=domains)
+        if cookies:
+            return cookies
         try:
             import rookiepy
-            domains = ["heb.com", ".heb.com", "accounts.heb.com"]
-            rookie_cookies = rookiepy.chrome(domains)
-            if not rookie_cookies:
+            raw = rookiepy.safari(domains)
+            res = []
+            for c in (raw or []):
+                name = c.get("name")
+                val = c.get("value")
+                if name and val:
+                    res.append({
+                        "name": name,
+                        "value": val,
+                        "domain": c.get("domain", ".heb.com"),
+                        "path": c.get("path", "/"),
+                        "secure": bool(c.get("secure", True)),
+                        "httpOnly": bool(c.get("http_only", False)),
+                        "expires": c.get("expires"),
+                    })
+            return res
+        except Exception:
+            return []
+
+    def _harvest_chrome_cookies(self, domains: List[str]) -> List[Dict[str, Any]]:
+        """Extracts cookies from local Google Chrome database using rookiepy."""
+        try:
+            import rookiepy
+            raw = rookiepy.chrome(domains)
+            res = []
+            for c in (raw or []):
+                name = c.get("name")
+                val = c.get("value")
+                if name and val:
+                    res.append({
+                        "name": name,
+                        "value": val,
+                        "domain": c.get("domain", ".heb.com"),
+                        "path": c.get("path", "/"),
+                        "secure": bool(c.get("secure", True)),
+                        "httpOnly": bool(c.get("http_only", False)),
+                        "expires": c.get("expires"),
+                    })
+            return res
+        except Exception:
+            return []
+
+    def _harvest_from_rookiepy(self) -> Optional[SessionState]:
+        """Harvests cookies from Safari and Chrome, prioritizing valid authenticated sessions."""
+        try:
+            domains = ["heb.com", ".heb.com", "accounts.heb.com", "www.heb.com"]
+            safari_cookies = self._harvest_safari_cookies(domains)
+            chrome_cookies = self._harvest_chrome_cookies(domains)
+
+            if not safari_cookies and not chrome_cookies:
                 return None
 
-            raw_cookies = []
-            cookies_dict = {}
-            for c in rookie_cookies:
+            def evaluate_cookies(cookie_list: List[Dict[str, Any]]) -> Tuple[bool, Optional[float], bool, int]:
+                c_dict = {c["name"]: c["value"] for c in cookie_list if c.get("name") and c.get("value")}
+                has_sat = "sat" in c_dict
+                sat_valid, sat_exp = check_sat_token(c_dict.get("sat", "")) if has_sat else (False, None)
+                has_sst = "sst" in c_dict
+                return sat_valid, sat_exp, has_sst, len(c_dict)
+
+            safari_sat_valid, safari_sat_exp, safari_has_sst, safari_count = evaluate_cookies(safari_cookies)
+            chrome_sat_valid, chrome_sat_exp, chrome_has_sst, chrome_count = evaluate_cookies(chrome_cookies)
+
+            if safari_sat_valid and not chrome_sat_valid:
+                chosen_source = "safari"
+                primary_cookies = safari_cookies
+                secondary_cookies = chrome_cookies
+            elif chrome_sat_valid and not safari_sat_valid:
+                chosen_source = "chrome"
+                primary_cookies = chrome_cookies
+                secondary_cookies = safari_cookies
+            elif safari_cookies and not chrome_cookies:
+                chosen_source = "safari"
+                primary_cookies = safari_cookies
+                secondary_cookies = []
+            elif chrome_cookies and not safari_cookies:
+                chosen_source = "chrome"
+                primary_cookies = chrome_cookies
+                secondary_cookies = []
+            else:
+                # Both present: prioritize Safari if it has recent sst or cookies
+                if safari_has_sst or safari_count >= chrome_count:
+                    chosen_source = "safari"
+                    primary_cookies = safari_cookies
+                    secondary_cookies = chrome_cookies
+                else:
+                    chosen_source = "chrome"
+                    primary_cookies = chrome_cookies
+                    secondary_cookies = safari_cookies
+
+            raw_cookies: List[Dict[str, Any]] = []
+            cookies_dict: Dict[str, str] = {}
+            for c in primary_cookies:
                 name = c.get("name")
                 val = c.get("value")
                 if name and val:
@@ -408,7 +592,21 @@ class CDPSessionHarvester:
                         "domain": c.get("domain", ".heb.com"),
                         "path": c.get("path", "/"),
                         "secure": bool(c.get("secure", True)),
-                        "httpOnly": bool(c.get("http_only", False)),
+                        "httpOnly": bool(c.get("httpOnly") or c.get("http_only", False)),
+                    })
+
+            for c in secondary_cookies:
+                name = c.get("name")
+                val = c.get("value")
+                if name and val and name not in cookies_dict:
+                    cookies_dict[name] = val
+                    raw_cookies.append({
+                        "name": name,
+                        "value": val,
+                        "domain": c.get("domain", ".heb.com"),
+                        "path": c.get("path", "/"),
+                        "secure": bool(c.get("secure", True)),
+                        "httpOnly": bool(c.get("httpOnly") or c.get("http_only", False)),
                     })
 
             # Check if any cached session tokens (like sat/reese84) exist to merge
@@ -434,7 +632,7 @@ class CDPSessionHarvester:
             is_auth = (has_sat and is_sat_valid_flag) or has_sst
 
             return SessionState(
-                source="rookiepy",
+                source=chosen_source,
                 cookies=cookies_dict,
                 raw_cookies=raw_cookies,
                 local_storage=local_storage_dict,
@@ -449,7 +647,7 @@ class CDPSessionHarvester:
                 sat_expires_at=sat_exp,
             )
         except Exception as ex:
-            logger.debug(f"Rookiepy extraction note: {ex}")
+            logger.debug(f"Local browser cookie extraction note: {ex}")
             return None
 
     def _harvest_from_cache(self) -> Optional[SessionState]:

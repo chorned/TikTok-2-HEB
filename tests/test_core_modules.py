@@ -184,14 +184,15 @@ class TestHEBClientAndCascade(unittest.TestCase):
             {"product_id": "590002", "name": "H-E-B Organics Jasmine Rice", "brand": "H-E-B Organics", "price": 5.28, "in_stock": True, "package_size": "16 oz"},
             {"product_id": "590003", "name": "Central Market Jasmine Rice", "brand": "Central Market", "price": 5.99, "in_stock": True, "package_size": "1 lb"},
         ]
-        with patch.object(self.client, "_search_via_playwright", return_value=sample_cards):
+        with patch.object(self.client.graphql_client, "product_search", return_value=sample_cards):
             results = self.client.search_heb_product("jasmine rice", store_id="390")
             self.assertGreaterEqual(len(results), 3)
             self.assertTrue(any("jasmine rice" in r["name"].lower() for r in results))
 
     def test_search_heb_product_waf_loud_failure(self):
         """Verify that Imperva WAF challenges trigger a loud HEBWAFChallengeError."""
-        with patch.object(self.client, "_search_via_playwright", side_effect=HEBWAFChallengeError("Imperva Anti-Bot WAF challenge blocked search")):
+        with patch.object(self.client.graphql_client, "product_search", side_effect=HEBWAFChallengeError("Imperva Anti-Bot WAF challenge blocked search")), \
+             patch.object(self.client, "_search_via_playwright", side_effect=HEBWAFChallengeError("Imperva Anti-Bot WAF challenge blocked search")):
             with self.assertRaises(HEBWAFChallengeError):
                 self.client.search_heb_product("jasmine rice", store_id="390")
 

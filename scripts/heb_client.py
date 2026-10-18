@@ -204,9 +204,11 @@ class HEBClient:
             if session_file.is_file():
                 try:
                     with open(session_file, "r") as f:
-                        cookies = json.load(f)
-                    context.add_cookies(cookies)
-                    logger.info(f"Loaded {len(cookies)} cached session cookies from {session_file}")
+                        raw_data = json.load(f)
+                    cookies = raw_data.get("cookies", []) if isinstance(raw_data, dict) else (raw_data if isinstance(raw_data, list) else [])
+                    if cookies:
+                        context.add_cookies(cookies)
+                        logger.info(f"Loaded {len(cookies)} cached session cookies from {session_file}")
                 except Exception as ex:
                     logger.warning(f"Could not load session cookies: {ex}")
 
@@ -337,9 +339,11 @@ class HEBClient:
                 if session_file.is_file():
                     try:
                         with open(session_file, "r") as f:
-                            c = json.load(f)
-                        context.add_cookies(c)
-                        logger.info(f"Loaded {len(c)} session cookies from {session_file}")
+                            raw_c = json.load(f)
+                        c = raw_c.get("cookies", []) if isinstance(raw_c, dict) else (raw_c if isinstance(raw_c, list) else [])
+                        if c:
+                            context.add_cookies(c)
+                            logger.info(f"Loaded {len(c)} session cookies from {session_file}")
                     except Exception as e:
                         logger.warning(f"Failed to load cached cookies: {e}")
 
