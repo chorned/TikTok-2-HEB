@@ -1,20 +1,46 @@
 ---
-name: tiktok-2-heb
-description: Converts short-form cooking and recipe videos (TikTok, Instagram Reels, YouTube Shorts) into scaled, pantry-audited H-E-B grocery carts ready for curbside pickup.
+name: heb-mcp.skill
+description: Full-featured H-E-B grocery assistant and recipe-to-cart skill (formerly tiktok-2-heb). Searches local store inventory, resolves preferred items from past orders, clips digital coupons, stages carts, and converts cooking videos (TikTok, Instagram Reels, YouTube Shorts) into scaled, pantry-audited H-E-B grocery carts.
 ---
 
-# TikTok-2-HEB Agent Skill
+# heb-mcp.skill (TikTok-2-HEB) Agent Skill
 
-Transform incoming cooking and recipe video URLs into scaled, pantry-audited H-E-B grocery carts with kid-friendly culinary adaptations and deterministic out-of-stock substitutions.
+Manage live H-E-B grocery carts, resolve preferred household products from purchase history, clip coupons, and transform cooking video URLs into scaled, pantry-audited H-E-B grocery carts with deterministic out-of-stock substitutions.
 
 ---
 
 ## 🎯 Trigger Conditions
 
 Activate this skill whenever:
-1. An authorized user shares a cooking or recipe URL from **TikTok** (`tiktok.com`, `vm.tiktok.com`), **Instagram Reels** (`instagram.com/reel/`), or **YouTube Shorts** (`youtube.com/shorts/`).
-2. A user asks to convert, scale, or order groceries for a recipe video (e.g. *"Order the ingredients for this recipe from H-E-B"*, *"Put this TikTok dinner into my cart"*).
-3. A user replies to an existing grocery review thread with post-staging adjustments (e.g. *"add soy sauce"*, *"swap regular salmon for wild sockeye"*, *"make that swap permanent"*).
+1. A user asks to search H-E-B, check their cart, switch their preferred store or fulfillment method (Curbside vs. Delivery), clip coupons, or add/remove groceries at H-E-B (e.g. *"Add whole milk and butter tortillas to my H-E-B cart"*).
+2. An authorized user shares a cooking or recipe URL from **TikTok** (`tiktok.com`, `vm.tiktok.com`), **Instagram Reels** (`instagram.com/reel/`), or **YouTube Shorts** (`youtube.com/shorts/`).
+3. A user asks to convert, scale, or order groceries for a recipe video (e.g. *"Order the ingredients for this recipe from H-E-B"*, *"Put this TikTok dinner into my cart"*).
+4. A user replies to an existing grocery review thread with post-staging adjustments (e.g. *"add soy sauce"*, *"swap regular salmon for wild sockeye"*, *"make that swap permanent"*).
+5. A user asks to set up or configure `heb-mcp.skill` (`TikTok-2-HEB`) for the first time.
+
+---
+
+## 🚀 First-Time Setup (Agent-Driven Onboarding)
+
+When a user asks you to set up this project, handle the technical steps for them and only ask brief, plain-English questions:
+1. **Install environment & binaries:**
+   ```bash
+   uv venv --python 3.11 .venv && source .venv/bin/activate && uv pip install -r requirements.txt
+   playwright install chromium
+   cp -n .env.example .env
+   cp -n config/household.example.yaml config/household.yaml
+   cp -n config/pantry_staples.example.json config/pantry_staples.json
+   ```
+2. **Ask the user quick setup questions:**
+   - **Preferred H-E-B store & fulfillment method:** Ask which H-E-B store they shop at (look up/update `HEB_STORE_ID` in `.env` and `store` in `config/household.yaml`, and help them switch their active store or toggle between Curbside Pickup and Home Delivery whenever requested).
+   - **Household size:** Ask how many adults/kids they cook for (update `config/household.yaml`).
+3. **Harvest session & sync past orders:** Ask the user to make sure they are logged into `heb.com` in Safari or Chrome, then run:
+   ```bash
+   python scripts/heb_client.py --harvest
+   python scripts/cache_manager.py update-preferred-skus
+   python tests/test_skill_setup.py
+   ```
+4. **Set up automatic daily token refresh cronjob:** Strongly encourage the user to let you install a recurring 24-hour cronjob (`0 9 * * * cd <REPO_PATH> && .venv/bin/python scripts/heb_client.py --harvest >/dev/null 2>&1`) so their H-E-B session stays warm automatically.
 
 ---
 
@@ -32,6 +58,9 @@ Activate this skill whenever:
 4. **Kid-Friendly Preparation Split:**
    - When `kid_friendly_split` is enabled, decouple capsaicin/heat (`sriracha`, `chili flakes`, `cayenne`, `jalapeños`) from the base skillet. Keep the main vessel mild, plate the child's portion first, and season adult portions at the end.
    - Add reminders to cut proteins and choking hazards into 1/2-inch bite-sized cubes.
+5. **Automated Token Refresh (Daily Cronjob Encouragement):**
+   - While H-E-B's short-lived session access token (`sat`) rotates every 30 minutes, `heb_graphql.py` automatically refreshes it on demand using the long-lived session token (`sst`).
+   - During initial setup or after harvesting/refreshing a session, **proactively encourage the user to let you set up an automated 24-hour cronjob** that keeps their underlying H-E-B session and anti-bot token (`reese84`) validated in the background so they don't have to manually log back in before grocery runs.
 
 ---
 
@@ -111,6 +140,14 @@ python scripts/heb_client.py --coupon-clip <COUPON_ID> --confirm
 > [!IMPORTANT]
 > **Human-in-the-Loop Checkout Gate:** AGY is strictly prohibited from executing checkout, payment, or delivery/pickup window booking mutations. Cart staging and digital coupon clipping only; Carl always reviews and taps final checkout in the My H-E-B mobile app.
 
+### ⏱️ Recommended Background Cronjob (Daily Session Refresh)
+While H-E-B's short-lived `sat` token rotates every 30 minutes and is auto-refreshed on demand via `sst`, encourage the user to have a daily cronjob (macOS/Linux) or Scheduled Task (`schtasks` on Windows) that refreshes and validates the session once every 24 hours. Offer to install it into their `crontab` for them:
+
+```cron
+0 9 * * * cd /path/to/heb-mcp.skill && .venv/bin/python scripts/heb_client.py --harvest >/dev/null 2>&1
+```
+*(Or use `scripts/cron_refresh_heb_auth.py` / `scripts/cron_refresh_heb_auth.sh` if Slack notifications are desired.)*
+
 ### Step 6: Recipe Cache Persistence
 Persist the parsed recipe to ensure future runs hit the Hot Path:
 
@@ -164,3 +201,5 @@ When the user replies to the staged review thread:
 3. **"Make that swap permanent"**:
    - Execute `python scripts/cache_manager.py promote-sku ...` to update `primary_sku` in `cache/recipes/<slug>.yaml` and pin it in `cache/preferred_skus.json` with `source: "manual_override"`.
    - Confirm: *"Updated recipe cache: Central Market Wild Sockeye is now your primary SKU for this recipe and pinned as your preferred SKU."*
+4. **"Switch preferred store to [Store]" / "Switch to Curbside or Delivery"**:
+   - Update `HEB_STORE_ID` in `.env` and `store` in `config/household.yaml`, or update the active store/fulfillment mode on the H-E-B session, and re-verify cart item availability at the new store.

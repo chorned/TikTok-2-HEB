@@ -329,7 +329,7 @@ class HEBClient:
                         "Live interactive Chrome session on port 9222 was challenged."
                     )
 
-                results = self._extract_product_cards(page)
+                results = self.graphql_client._parse_next_data_html(content) or self._extract_product_cards(page)
                 page.close()
                 return results
             except HEBWAFChallengeError:
@@ -380,7 +380,7 @@ class HEBClient:
                     "synthetic mock fallback is prohibited."
                 )
 
-            results = self._extract_product_cards(page)
+            results = self.graphql_client._parse_next_data_html(content) or self._extract_product_cards(page)
             browser.close()
 
         return results
@@ -647,7 +647,7 @@ class HEBClient:
         """
         Direct authenticated SSR search for products (from texas-grocery-mcp).
         """
-        return self.graphql_client.product_search(query=query, store_id=store_id or self.store_id, limit=limit)
+        return self.search_heb_product(query=query, store_id=store_id)
 
     def product_search_batch(
         self,
@@ -750,18 +750,24 @@ class HEBClient:
         for ckey, psku in pref_map.items():
             aliases = [a.lower() for a in psku.get("aliases", [])]
             all_terms = [ckey] + aliases
-            for term in all_terms:
-                pat = r"\b" + re.escape(term) + r"\b"
-                if (
-                    re.search(pat, ing_key)
-                    or re.search(pat, search_query)
-                    or re.search(pat, recipe_req)
-                    or (culinary_key and culinary_key == term)
-                ):
+            if culinary_key:
+                if culinary_key in all_terms or any(term == culinary_key for term in all_terms):
                     is_manual = 1 if psku.get("source") == "manual_override" else 0
                     weight = float(psku.get("effective_weight", 1.0))
-                    matches.append((is_manual, weight, len(term), psku))
-                    break
+                    matches.append((is_manual, weight, len(ckey), psku))
+                    continue
+            else:
+                for term in all_terms:
+                    pat = r"\b" + re.escape(term) + r"\b"
+                    if (
+                        re.search(pat, ing_key)
+                        or re.search(pat, search_query)
+                        or re.search(pat, recipe_req)
+                    ):
+                        is_manual = 1 if psku.get("source") == "manual_override" else 0
+                        weight = float(psku.get("effective_weight", 1.0))
+                        matches.append((is_manual, weight, len(term), psku))
+                        break
 
         if matches:
             matches.sort(key=lambda m: (m[0], m[1], m[2]), reverse=True)

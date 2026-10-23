@@ -26,7 +26,7 @@ _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from scripts.cdp_harvester import CDPSessionHarvester, SessionState, get_live_session
+from scripts.cdp_harvester import CDPSessionHarvester, SessionState, get_live_session, check_sat_token
 
 logger = logging.getLogger("heb_graphql")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -118,16 +118,27 @@ class HEBGraphQLClient:
         # Check authentication requirements for user-scoped operations
         auth_operations = {"cartEstimated", "cartItemV2", "CouponClip", "SelectPickupFulfillment"}
         if operation_name in auth_operations:
-            if state.has_sat and not state.is_sat_valid:
-                raise HEBAuthenticationError(
-                    f"H-E-B Session Access Token ('sat') expired at timestamp {state.sat_expires_at}. "
-                    "An active human login session is required at https://www.heb.com/my-account/login. "
-                    "Under the Iron Law of External Integrations, execution halted at authentication boundary."
-                )
+            if not state.is_sat_valid:
+                # If sat is expired or missing, check if we can refresh via sst or accounts session
+                if state.has_sst or state.is_authenticated:
+                    logger.info("H-E-B 'sat' token is expired or missing; proceeding with 'sst' session (auto-refresh enabled)...")
+                    # If sat is completely missing, attempt proactive refresh first:
+                    if not state.has_sat:
+                        ok, new_sat, new_state = self.harvester.refresh_sat_token(state)
+                        if ok and new_state and new_state.is_sat_valid:
+                            state = new_state
+                            self._session_state = new_state
+                else:
+                    raise HEBAuthenticationError(
+                        f"H-E-B Session Access Token ('sat') expired at timestamp {state.sat_expires_at} and refresh cookies ('sst') are missing. "
+                        "An active human login session is required at https://www.heb.com/my-account/login. "
+                        "Under the Iron Law of External Integrations, execution halted at authentication boundary."
+                    )
             if not state.is_authenticated and not state.has_sat and not state.has_sst:
                 raise HEBAuthenticationError(
                     "H-E-B authentication session cookies ('sat', 'sst') are missing. "
-                    "Login required at https://www.heb.com/my-account/login."
+                    "Login required at https://www.heb.com/my-account/login. "
+                    "Under the Iron Law of External Integrations, execution halted at authentication boundary."
                 )
             # If reese84 token is completely missing, attempt 5-second Playwright warm-up
             if not state.has_reese84 and not state.has_valid_reese84:
@@ -216,19 +227,74 @@ class HEBGraphQLClient:
                 resp_text = h_resp.text
                 resp_json = h_resp.json
 
+            # Check if H-E-B minted / refreshed 'sat' in response cookies or Set-Cookie header
+            new_sat = None
+            if hasattr(resp, "cookies") and resp.cookies.get("sat"):
+                new_sat = resp.cookies.get("sat")
+            elif hasattr(resp, "headers") and "set-cookie" in resp.headers:
+                import re
+                m = re.search(r"\bsat=([^;]+)", resp.headers.get("set-cookie", ""))
+                if m:
+                    new_sat = m.group(1)
+
+            if new_sat:
+                sat_valid, sat_exp = check_sat_token(new_sat)
+                if sat_valid:
+                    logger.info(f"H-E-B automatically refreshed 'sat' token (expires: {sat_exp})")
+                    state.cookies["sat"] = new_sat
+                    state.has_sat = True
+                    state.is_sat_valid = True
+                    state.sat_expires_at = sat_exp
+                    state.is_authenticated = True
+                    self._session_state = state
+                    self.harvester.persist_token("sat", new_sat, expires=sat_exp)
+
             if status_code == 200:
                 data = resp_json()
                 if "errors" in data and data["errors"]:
                     err_text = str(data["errors"]).lower()
                     if "auth" in err_text or "unauthorized" in err_text:
-                        raise HEBAuthenticationError(f"H-E-B GraphQL authentication failure: {data['errors']}")
+                        # Attempt lazy refresh if not already in retry
+                        if not getattr(self, "_in_refresh_retry", False) and (state.has_sst or state.is_authenticated):
+                            self._in_refresh_retry = True
+                            try:
+                                logger.info("GraphQL returned unauthorized; attempting on-demand session refresh...")
+                                ok, refreshed_sat, new_state = self.harvester.refresh_sat_token(state)
+                                if ok and new_state and new_state.is_sat_valid:
+                                    self._session_state = new_state
+                                    return self.execute_persisted_query(operation_name, variables, session_state=new_state)
+                            finally:
+                                self._in_refresh_retry = False
+                        raise HEBAuthenticationError(
+                            f"H-E-B GraphQL authentication failure: {data['errors']}. "
+                            f"Session access token ('sat') expired at timestamp {state.sat_expires_at} and refresh failed. "
+                            "An active human login session is required at https://www.heb.com/my-account/login. "
+                            "Under the Iron Law of External Integrations, execution halted at authentication boundary."
+                        )
                     raise HEBGraphQLError(f"GraphQL returned errors: {data['errors']}")
                 return data.get("data", data)
             elif status_code in (401, 403) or "errorCode" in resp_text or "Pardon Our Interruption" in resp_text:
                 if "errorCode" in resp_text or "Pardon Our Interruption" in resp_text:
                     raise HEBWAFChallengeError(f"Imperva Anti-Bot WAF challenge intercepted request (HTTP {status_code}): {resp_text[:200]}")
+
+                # HTTP 401: attempt lazy refresh if not already in retry
+                if not getattr(self, "_in_refresh_retry", False) and (state.has_sst or state.is_authenticated):
+                    self._in_refresh_retry = True
+                    try:
+                        logger.info(f"GraphQL returned HTTP {status_code}; attempting on-demand session refresh...")
+                        ok, refreshed_sat, new_state = self.harvester.refresh_sat_token(state)
+                        if ok and new_state and new_state.is_sat_valid:
+                            self._session_state = new_state
+                            return self.execute_persisted_query(operation_name, variables, session_state=new_state)
+                    finally:
+                        self._in_refresh_retry = False
+
                 if status_code == 401 or "unauthorized" in resp_text.lower():
-                    raise HEBAuthenticationError(f"H-E-B authentication error (HTTP {status_code}): session expired or missing.")
+                    raise HEBAuthenticationError(
+                        f"H-E-B authentication error (HTTP {status_code}): session access token ('sat') expired at timestamp {state.sat_expires_at} and refresh failed. "
+                        "An active human login session is required at https://www.heb.com/my-account/login. "
+                        "Under the Iron Law of External Integrations, execution halted at authentication boundary."
+                    )
                 raise HEBWAFChallengeError(f"Imperva Anti-Bot WAF challenge intercepted request (HTTP {status_code}): {resp_text[:200]}")
             else:
                 raise HEBGraphQLError(f"H-E-B GraphQL request returned HTTP status {status_code}: {resp_text[:200]}")

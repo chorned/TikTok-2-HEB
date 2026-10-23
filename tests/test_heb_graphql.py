@@ -92,6 +92,34 @@ class TestCDPSessionHarvester(unittest.TestCase):
         self.assertEqual(state.cookies.get("sst"), "cached_sst_token")
         self.assertTrue(state.is_authenticated)
 
+    def test_safari_stale_sat_does_not_overwrite_valid_cached_sat(self):
+        """Verify that Safari on-disk stale sat never overwrites a newer/valid sat from cache."""
+        import base64
+        valid_exp = time.time() + 3600
+        header = base64.b64encode(json.dumps({"alg": "RS256"}).encode()).decode().rstrip("=")
+        valid_payload = base64.b64encode(json.dumps({"exp": valid_exp}).encode()).decode().rstrip("=")
+        valid_sat = f"{header}.{valid_payload}.sig"
+
+        self.harvester._persist_cookies([
+            {"name": "sat", "value": valid_sat, "domain": "www.heb.com"},
+            {"name": "sst", "value": "valid_sst", "domain": "www.heb.com"},
+        ])
+
+        expired_exp = time.time() - 3600
+        expired_payload = base64.b64encode(json.dumps({"exp": expired_exp}).encode()).decode().rstrip("=")
+        expired_sat = f"{header}.{expired_payload}.sig"
+        safari_cookies = [
+            {"name": "sat", "value": expired_sat, "domain": "www.heb.com"},
+            {"name": "sst", "value": "valid_sst", "domain": "www.heb.com"},
+        ]
+
+        with patch.object(self.harvester, "_harvest_safari_cookies", return_value=safari_cookies):
+            with patch.object(self.harvester, "_harvest_chrome_cookies", return_value=[]):
+                state = self.harvester._harvest_from_rookiepy()
+                self.assertIsNotNone(state)
+                self.assertEqual(state.cookies.get("sat"), valid_sat)
+                self.assertTrue(state.is_sat_valid)
+
 
 class TestHEBGraphQLClient(unittest.TestCase):
     """Test GraphQL persisted queries, confirm gates, and safety blocks."""
@@ -380,6 +408,45 @@ class TestReese84AndSatValidation(unittest.TestCase):
             client.execute_persisted_query("cartEstimated", {"userIsLoggedIn": True}, session_state=expired_session)
         self.assertIn("expired", str(ctx.exception).lower())
         self.assertIn("boundary", str(ctx.exception).lower())
+
+    @patch("curl_cffi.requests.post")
+    def test_auto_refresh_sat_on_graphql_success(self, mock_post):
+        """Verify that when H-E-B returns a new sat in response cookies, it is captured and persisted."""
+        import base64
+        client = HEBGraphQLClient()
+        temp_session_file = Path("/tmp/test_auto_refresh_sat.json")
+        client.harvester.session_path = temp_session_file
+        try:
+            future_exp = time.time() + 1800
+            header = base64.b64encode(json.dumps({"alg": "RS256"}).encode()).decode().rstrip("=")
+            valid_payload = base64.b64encode(json.dumps({"exp": future_exp}).encode()).decode().rstrip("=")
+            fresh_sat = f"{header}.{valid_payload}.signature"
+
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = '{"data": {"cartV2": {"id": "123"}}}'
+            mock_resp.json.return_value = {"data": {"cartV2": {"id": "123"}}}
+            mock_resp.cookies = {"sat": fresh_sat}
+            mock_post.return_value = mock_resp
+
+            session = SessionState(
+                source="test",
+                cookies={"sat": "stale_sat", "sst": "valid_sst"},
+                has_sat=True,
+                is_sat_valid=False,
+                sat_expires_at=time.time() - 100,
+                has_sst=True,
+                is_authenticated=True,
+                has_valid_reese84=True,
+            )
+            res = client.execute_persisted_query("cartEstimated", {"userIsLoggedIn": True}, session_state=session)
+            self.assertEqual(res.get("cartV2", {}).get("id"), "123")
+            self.assertEqual(session.cookies.get("sat"), fresh_sat)
+            self.assertTrue(session.is_sat_valid)
+            self.assertEqual(session.sat_expires_at, float(future_exp))
+        finally:
+            if temp_session_file.exists():
+                temp_session_file.unlink()
 
     @patch("playwright.sync_api.sync_playwright")
     def test_refresh_session_with_playwright_mock(self, mock_playwright):

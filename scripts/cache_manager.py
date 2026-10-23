@@ -286,6 +286,7 @@ CULINARY_RULES = [
     (r"\b(?:skim|fat[- ]free|nonfat)\s+milk\b", "skim milk", ["skim milk", "fat free milk", "milk"]),
     (r"\balmond\s+milk\b", "almond milk", ["almond milk"]),
     (r"\boat\s+milk\b", "oat milk", ["oat milk"]),
+    (r"\bcoconut\s+milk\b", "coconut milk", ["coconut milk"]),
     (r"\bmilk\b", "milk", ["milk"]),
     (r"\b(?:salted|unsalted|pure irish|grass[- ]fed|sweet cream)?\s*butter(?!\s+(?:tortillas?|croissants?|bread|cookies?))\b", "butter", ["butter", "salted butter", "unsalted butter"]),
     (r"\bcheese\b", "cheese", ["cheese"]),

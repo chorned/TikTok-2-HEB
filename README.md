@@ -1,271 +1,87 @@
-# 🛒 TikTok-2-HEB
+# 🛒 heb-mcp.skill
 
-> **Transform short-form cooking videos directly into scaled, pantry-audited H-E-B grocery carts.**
+![Claude, ChatGPT, and Gemini at H-E-B](assets/banner.jpg)
+
+> **Your AI-powered H-E-B grocery assistant: build carts from plain English or cooking videos (TikTok, Reels, YouTube Shorts), auto-pick your favorite brands, clip coupons, and checkout in the My H-E-B app.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: Passing](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
-[![Platform: macOS%20%7C%20Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
+[![Platform: macOS%20%7C%20Linux%20%7C%20Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
 
-**TikTok-2-HEB** is an autonomous, channel-agnostic AI agent skill and CLI toolkit that ingests recipe URLs (TikTok, Instagram Reels, YouTube Shorts), extracts ingredients and cooking techniques via a zero-auth multimodal pipeline, scales portions to match household demographics, checks kitchen pantry staples to avoid duplicate purchases, and stages candidate items directly into your local H-E-B curbside cart using a resilient 4-tier out-of-stock fallback cascade.
+A lot of people have **Claude Code** (or another AI coding agent) included in their subscription, but haven't used it yet because terminal tools feel intimidating.
 
----
-
-## 🏗️ System Architecture
-
-```mermaid
-flowchart TD
-    A["📱 User Ingress (iMessage / Slack / CLI)<br>TikTok / Reels / Shorts URL"] --> B["⚡ Pass 1: Zero-Auth Metadata & Subtitles<br>(yt-dlp + curl-cffi impersonation)"]
-    B --> C{"Sufficient Recipe Text?<br>(>= 3 culinary measurement tokens)"}
-    
-    C -- Yes --> E["🍳 Recipe Parser & Household Scaler"]
-    C -- No --> D["🎙️ Pass 2 & 3: Audio & Keyframe Fallback<br>(ffmpeg -nostdin -hide_banner)"]
-    D --> E
-    
-    E --> F["🧂 Pantry Comparator<br>(config/pantry_staples.json)"]
-    F --> G["💾 Standalone YAML Cache<br>(cache/recipes/<slug>.yaml)"]
-    
-    G --> H["🛒 5-Tier Fallback Cascade<br>(scripts/heb_client.py)"]
-    
-    subgraph OOS_Cascade ["5-Tier Out-of-Stock Fallback Engine"]
-        T0["Tier 0: Preferred SKU Match & Sizing Math<br>(cache/preferred_skus.json)"]
-        T1["Tier 1: Exact Primary SKU Match"]
-        T2["Tier 2: Brand Hierarchy Substitution<br>(H-E-B → CM → Hill Country Fare)"]
-        T3["Tier 3: Organic ↔ Conventional Swap"]
-        T4["Tier 4: Package Size Math / Human Escalation"]
-        T0 --> T1 --> T2 --> T3 --> T4
-    end
-    
-    H --> OOS_Cascade
-    OOS_Cascade --> I["🛍️ H-E-B Cart Staging<br>(Playwright Headless / GraphQL)"]
-    I --> J["📱 Mobile Review Summary (iMessage / Slack)<br>Hard Human-in-the-Loop Checkout Gate"]
-```
+**heb-mcp.skill** *(formerly TikTok-2-HEB)* is built so **your AI does the technical work and you just do the eating.** You don't need to memorize terminal commands or edit code files—you just talk to Claude in plain English.
 
 ---
 
-## ✨ Key Capabilities
+## 🙋 What You Do vs. 🤖 What Your AI Does
 
-### 1. 🔓 Zero-Auth Multimodal Extractor
-- **No API Keys or Logins Required:** Leverages `yt-dlp` paired with `curl-cffi` browser fingerprint impersonation (`chrome`) to scrape video descriptions, chapters, and auto-caption tracks anonymously.
-- **3-Pass Resilience:**
-  1. *Pass 1:* Instant metadata extraction + WebVTT / SRT auto-subtitles.
-  2. *Pass 2:* Smart subtitle cleaner stripping timestamps, styling tags, and rolling caption duplicates.
-  3. *Pass 3:* Heuristic fallback downloading high-efficiency MP3 audio or 0.5 fps video keyframes for silent or music-overlaid videos.
+### 1. One-Time Setup (~3 Minutes)
+* **What you do:** Make sure you're logged into [heb.com](https://www.heb.com) in your web browser (Safari or Chrome), open Claude Code, and paste the setup prompt below.
+* **What your AI does:** Downloads this project, installs the tools, asks which H-E-B store you shop at (and whether you prefer Curbside Pickup or Delivery) plus how many people you're feeding, learns your favorite brands from your past orders, and sets up a daily background job so you stay logged in.
 
-### 2. 🛡️ 5-Tier Fallback Cascade with Tier-0 Preferred SKUs (Anti-Cache-Poisoning)
-When items are processed for recipe staging or ad-hoc requests, the fallback engine walks a deterministic hierarchy without corrupting original recipe preferences:
-- **Tier 0 (Preferred SKU & Sizing Math):** Resolves canonical food keys against `cache/preferred_skus.json` (populated from past orders and manual pins). Calculates package quantity using ceiling volume/weight/count math (e.g. 48 oz requirement / 32 oz package -> 2 packages).
-- **Tier 1 (Exact SKU):** Adds known primary SKU if in stock.
-- **Tier 2 (Brand Hierarchy):** Matches equivalent product walking `H-E-B` → `H-E-B Organics` → `Central Market` → `Mi Tienda` → `Hill Country Fare` → `National Brand`.
-- **Tier 3 (Organic ↔ Conventional Swap):** Fulfills organic orders with conventional or vice-versa when single-tier stockouts occur.
-- **Tier 4 (Package Size Adjustment & Escalation):** Adjusts ordering quantities or flags category wipeouts as `⚠️ OUT OF STOCK (NEEDS HUMAN CALL)`.
-- *Invariant:* Temporary substitutions **never** overwrite `primary_sku` in the recipe cache unless explicitly instructed by a human.
-
-### 3. 👶 Household Scaler & Kid-Friendly Split
-- Multiplies batch yield to match configured family portions (default `2.5` servings for 2 adults + 1 toddler).
-- Enforces a minimum batch scaling factor (`0.65`) to prevent pan under-crowding and sauce reduction dry-out.
-- **Spice Decoupling:** Identifies capsaicin elements (`sriracha`, `chili flakes`, `jalapeño`, `cayenne`, `gochujang`) and automatically splits cooking instructions—keeping the skillet base mild, plating the child's portion first, and dressing adult portions at the end.
-- **Safety Prep:** Adds reminders to cube proteins into 1/2-inch bite-sized pieces.
-
-### 4. 🧂 Pantry Deduplication
-- Audits ingredients against a customizable 40+ canonical pantry database (`config/pantry_staples.json`).
-- Automatically skips or tags common household staples (oils, vinegars, kosher salt, black pepper, soy sauce, cornstarch, baking essentials) so carts remain uncluttered.
-
-### 5. 🔒 Hard Human-in-the-Loop (HITL) Gate
-- Stages items into the cart and clips digital coupons.
-- **Strict Invariant:** Never submits payment, selects delivery slots, or places final orders autonomously. Final review and one-tap checkout remain in the official **My H-E-B** mobile app.
+### 2. Everyday Grocery Runs (~10 Seconds)
+* **What you do:** Ask for groceries in plain English (*"Add milk, eggs, and butter tortillas to my cart"*, *"Switch my store to Mueller H-E-B"*, *"Switch my cart to Curbside"*) **or** paste a TikTok, Instagram Reel, or YouTube Short recipe link (*"Put this dinner in my H-E-B cart"*).
+* **What your AI does:**
+  * If you sent a video, extracts the recipe automatically (no TikTok or Instagram login needed), scales portions for your family, and separates spicy steps if you have kids.
+  * Intelligently suggests skipping pantry staples you likely already have at home (salt, pepper, olive oil, soy sauce).
+  * Picks the exact H-E-B products and brands you usually buy, automatically swapping for an in-stock alternative if your store is out.
+  * Clips matching digital coupons and stages everything into your live H-E-B cart.
+* **What you do last:** Glance at the summary, reply if you want to add or swap anything, and tap **Checkout** in your **My H-E-B** phone app. *(Your AI will **never** pay or place an order without you.)*
 
 ---
 
-## 🚀 Quickstart
+## 🚀 Getting Started (Copy & Paste)
 
-### Prerequisites
-- Python 3.11+
-- `ffmpeg` (`brew install ffmpeg` on macOS or `sudo apt install ffmpeg` on Linux)
-- [uv](https://github.com/astral-sh/uv) (recommended) or standard `pip`
-
-### 1. Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/chorned/TikTok-2-HEB.git
-cd TikTok-2-HEB
-
-# Create virtual environment and install dependencies
-uv venv --python 3.11 .venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
-
-# Install Playwright browser binaries
-playwright install chromium
-```
-
-### 2. Configuration
-
-```bash
-# 1. Setup local environment
-cp .env.example .env
-
-# 2. Setup household & pantry configurations
-cp config/household.example.yaml config/household.yaml
-cp config/pantry_staples.example.json config/pantry_staples.json
-```
-
-Edit `.env` and `config/household.yaml` with your preferred H-E-B store (e.g. Store `390` for Austin - S. Congress / Oltorf):
-
-```bash
-HEB_STORE_ID=390
-GEMINI_API_KEY=your_gemini_api_key_here
-PLAYWRIGHT_HEADLESS=true
-```
-
-### 3. Pre-Flight Diagnostics Verification
-
-Run the unified setup test suite to ensure all dependencies, system binaries, and configuration files are 100% operational:
-
-```bash
-python tests/test_skill_setup.py
-```
-
-Expected output:
-```text
-======================================================================
-🚀 ALL TIKTOK-2-HEB PRE-FLIGHT CHECKS PASSED (100% OPERATIONAL)
-======================================================================
-Ran 7 tests in 1.8s
-OK
-```
-
----
-
-## 💻 CLI Usage
-
-### 1. Extract Recipe Media (Zero-Auth)
-```bash
-python scripts/extract_recipe_media.py "https://www.tiktok.com/@creator/video/73491829104"
-```
-
-Outputs clean metadata, parsed subtitles, and transcription tokens in JSON format.
-
-### 2. Recipe Cache & Preferred SKU Operations
-```bash
-# Lookup an existing recipe by video ID, URL, or slug
-python scripts/cache_manager.py lookup --query "73491829104"
-
-# Save or update a structured recipe YAML file
-python scripts/cache_manager.py save --file sample_recipe.yaml
-
-# Sync preferred SKUs from past orders & Buy It Again (recency-weighted)
-python scripts/cache_manager.py update-preferred-skus
-
-# Manually pin a preferred SKU override
-python scripts/cache_manager.py pin-preferred-sku \
-  --ingredient "whole milk" \
-  --sku "4122012345" \
-  --product "123456" \
-  --name "H-E-B Organics Whole Milk" \
-  --package-size "1 gal"
-
-# Permanently promote a user-selected substitution to primary SKU and pin preferred SKU
-python scripts/cache_manager.py promote-sku \
-  --recipe-id "crispy-honey-garlic-salmon" \
-  --ingredient-key "salmon_fillet" \
-  --product-id "410294" \
-  --name "Central Market Organics Atlantic Salmon" \
-  --qty 1
-```
-
-### 3. Test H-E-B Catalog Search, Tier-0 Resolution & OOS Cascade
-```bash
-# Search H-E-B store catalog
-python scripts/heb_client.py "Atlantic Salmon" --store-id 390
-
-# Test 5-Tier Fallback Cascade on an ingredient
-python scripts/heb_client.py "Atlantic Salmon" --tier-test
-
-# Resolve an ingredient or ad-hoc query with package size math
-python scripts/heb_client.py --resolve-sku "48 oz beef broth"
-
-# Stage an ingredient into the live H-E-B cart (requires human-in-the-loop --confirm)
-python scripts/heb_client.py --stage-sku "48 oz beef broth" --confirm
-```
-
----
-
-## 📱 Mobile Review Template (iMessage / BlueBubbles)
-
-When integrated with an agent (such as Hermes or Golem), reviews are formatted for crisp readability on mobile devices:
+Open **Claude Code** (or your favorite AI agent) and paste this message:
 
 ```text
-🛒 H-E-B Cart Staged: Crispy Honey Garlic Salmon Bites
-Scaled for 2 Adults + 1 Kid (~2.5 servings)
+Clone https://github.com/chorned/heb-mcp.skill.git and set it up for me.
+Ask me for my preferred H-E-B store, whether I use Curbside or Delivery, and my household size, sync my preferred items from my past H-E-B orders, and set up a daily background job to refresh my H-E-B token so I stay logged in.
+```
 
-👶 Kid Prep Note:
-• Hold the 1 tbsp sriracha out of the main skillet glaze. Plate the kid's portion first, then toss adult portions with sriracha.
-• Cut kid's salmon into 1/2-inch bite-sized cubes.
+Claude will read [`SKILL.md`](SKILL.md) and walk you through the rest in plain English.
 
-✅ Added to H-E-B Cart (4 items):
-• 1x H-E-B Fresh Atlantic Salmon Fillet (~1.25 lb) — $13.74
-• 1x H-E-B Pure Clover Honey (12 oz) — $4.48
-• 1x Fresh Green Onions (1 bunch) — $0.88
-• 1x H-E-B Jasmine Rice (32 oz) — $2.74
+---
 
-🔄 Auto-Subbed (Out of Stock at Store):
-• 2x H-E-B Broccoli Florets (10 oz bag) — $4.56
-  (1 lb Organic Crowns were OOS; subbed 2x 10oz bags for this order only)
+## 🔄 Stay Logged In Automatically (Recommended Daily Job)
 
-🎟️ Coupons Clipped:
-• $1.00 off H-E-B Fresh Seafood Tray
+While H-E-B's short-lived access tokens (`sat`) rotate every 30 minutes, this skill automatically refreshes them on the fly using your persistent session token (`sst`). To keep your underlying session warm so you never have to manually log back in before adding groceries, **have your AI set up a simple background job** that refreshes your token once every 24 hours.
 
-🏠 Pantry Check (Skipped — reply to add):
-• Soy sauce (3 tbsp), Garlic (4 cloves), Cornstarch (2 tbsp), Sesame oil (1 tsp)
+You can just tell Claude Code:
+> *"Set up a daily cronjob (or Scheduled Task on Windows) to refresh my H-E-B session token every 24 hours."*
 
-📱 Next Step:
-Reply if you want to add a pantry item (e.g. "add soy sauce") or swap a brand. Otherwise, open the My H-E-B app to review and tap checkout!
+Or if you prefer adding it yourself on macOS/Linux via `crontab -e`:
+```cron
+0 9 * * * cd /path/to/heb-mcp.skill && .venv/bin/python scripts/heb_client.py --harvest >/dev/null 2>&1
 ```
 
 ---
 
-## 📂 Directory Layout
+## ✨ Capabilities
 
-```text
-TikTok-2-HEB/
-├── .env.example                      # Template environment variables
-├── .gitignore                        # Strict rules against credential & cache leaks
-├── README.md                         # Public documentation & architecture guide
-├── SKILL.md                          # Agent skill contract & deterministic workflow
-├── requirements.txt                  # Pinned core dependencies
-├── config/
-│   ├── household.example.yaml        # Committed generic household configuration
-│   ├── pantry_staples.example.json   # Committed 40-item standard pantry list
-│   ├── household.yaml                # [GITIGNORED] Local active household profile
-│   └── pantry_staples.json           # [GITIGNORED] Local pantry bypass list
-├── scripts/
-│   ├── extract_recipe_media.py       # 3-Pass zero-auth multimodal media extractor
-│   ├── cache_manager.py              # Pydantic models, pantry comparator, YAML & preferred SKUs engine
-│   ├── cdp_harvester.py              # Chrome CDP session & cookie harvester
-│   ├── heb_client.py                 # H-E-B product search & 5-tier OOS fallback engine
-│   └── heb_graphql.py                # Authenticated SSR extraction & GraphQL client
-├── cache/                            # [GITIGNORED] Local media, session & recipe database
-│   ├── .gitkeep                      # Preserves directory structure across clean git clones
-│   ├── heb_session.json              # Harvested WAF/Bearer session tokens
-│   ├── index.json                    # Fast lookup index for cached recipes
-│   ├── preferred_skus.json           # Time-decay ranked past orders & manual pins
-│   ├── media/                        # Temporary audio tracks & extracted video keyframes
-│   └── recipes/                      # Persistent recipe YAML database
-└── tests/
-    ├── test_core_modules.py          # Unit tests for extractor, cache, and cascade
-    ├── test_heb_client.py            # Unit tests for Tier-0 resolution and package sizing math
-    ├── test_heb_graphql.py           # Unit tests for GraphQL client, WAF, and SSR parsing
-    ├── test_past_orders.py           # Unit tests for past order and buy-it-again queries
-    ├── test_preferred_skus.py        # Unit tests for preferred SKUs decay and culinary normalization
-    └── test_skill_setup.py           # Unified diagnostic & setup verification test
-```
+* **Social Media Recipe Extraction:** Share recipes directly from **TikTok**, **Instagram Reels**, or **YouTube Shorts**. Extracts ingredients and measurements automatically from captions, audio, or video frames (zero login required), scales portions to fit your household, and splits out spicy steps for kids.
+* **Full H-E-B Store & Cart Control:** Anything you can do on `heb.com`, your AI can handle for you:
+  * **Add & Remove Items:** Build or edit your live H-E-B cart from plain English or recipe links.
+  * **Switch Delivery Method:** Toggle between **Curbside Pickup** and **Home Delivery**.
+  * **Switch Preferred Store:** Set your home store during onboarding or switch to a different H-E-B location anytime.
+  * **Apply Coupons:** Search and clip digital H-E-B coupons directly to your account.
+  * **Smart Pantry Suggestions:** Intelligently identifies items likely already in your pantry (spices, oils, condiments) and suggests skipping them so you don't buy duplicates.
+* **Preferred Brand & Recipe Caching:** Learns your favorite brands and package sizes from your past H-E-B orders and caches them locally alongside parsed recipes. Your preferred brands are always selected first, and temporary out-of-stock substitutions never overwrite your saved favorites unless you ask to make a swap permanent.
+
+---
+
+## 🔒 Privacy & Security
+
+* **No Passwords Stored or Shared:** You log into [heb.com](https://www.heb.com) directly in your own web browser. Neither this tool nor your AI ever asks for, sees, or saves your H-E-B username or password.
+* **Token-Only Access:** Once you log in, the tool only grabs the session token generated by your browser session to manage your cart and clip coupons.
+* **OS-Level Encrypted Storage:** Your session token is protected by your operating system's default encrypted credential vault—such as **macOS Keychain** on Mac or **Windows Credential Manager / Data Protection API (DPAPI)** on Windows.
+* **You Always Control Checkout:** Your AI can stage items and clip coupons, but it is strictly blocked from submitting payment or placing an order. You always review your cart and tap **Checkout** yourself in the **My H-E-B** app.
 
 ---
 
 ## 📄 License
 
-Distributed under the MIT License. See `LICENSE` for details.
+Distributed under the MIT License.
 
 *Disclaimer: This project is an independent open-source tool and is not affiliated with, endorsed by, or sponsored by H-E-B, TikTok, ByteDance, or Instagram.*

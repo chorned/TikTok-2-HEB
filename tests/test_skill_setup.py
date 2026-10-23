@@ -2,7 +2,7 @@
 """
 tests/test_skill_setup.py
 
-Single Unified Setup & Diagnostic Verification Test for TikTok-2-HEB.
+Single Unified Setup & Diagnostic Verification Test for heb-mcp.skill (TikTok-2-HEB).
 Audits all operational prerequisites:
   1. Python dependencies (yt-dlp, curl_cffi, playwright, pydantic, pyyaml, requests, bs4)
   2. External binaries (ffmpeg)
@@ -42,12 +42,12 @@ class DiagnosticAudit:
     def print_report(self):
         if not self.issues:
             print("\n" + "=" * 70)
-            print("🚀 ALL TIKTOK-2-HEB PRE-FLIGHT CHECKS PASSED (100% OPERATIONAL)")
+            print("🚀 ALL HEB-MCP.SKILL (TIKTOK-2-HEB) PRE-FLIGHT CHECKS PASSED (100% OPERATIONAL)")
             print("=" * 70 + "\n")
             return
 
         print("\n" + "!" * 70)
-        print("⚠️  TIKTOK-2-HEB SETUP DIAGNOSTIC REPORT: ACTION REQUIRED")
+        print("⚠️  HEB-MCP.SKILL (TIKTOK-2-HEB) SETUP DIAGNOSTIC REPORT: ACTION REQUIRED")
         print("!" * 70)
         for i, (issue, remedy) in enumerate(zip(self.issues, self.recommendations), 1):
             print(f"\n[{i}] ISSUE: {issue}")

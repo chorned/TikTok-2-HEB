@@ -257,7 +257,8 @@ class CDPSessionHarvester:
         """
         Harvests live cookies prioritizing Chrome over CDP (127.0.0.1:9222).
         Falls back to rookiepy local Chrome extraction or saved cache.
-        If refresh_if_needed is True and reese84 token is missing/expired, executes 5-second Playwright refresh.
+        If refresh_if_needed or ensure_warmup is True and sat is expired or reese84 token is missing/expired,
+        executes session refresh / warm-up pass.
         """
         # 1. Attempt Chrome CDP on 127.0.0.1:9222
         cdp_state = self._harvest_from_cdp(ensure_warmup=ensure_warmup, launch_if_missing=launch_if_missing)
@@ -270,7 +271,12 @@ class CDPSessionHarvester:
         if rookie_state:
             logger.info(f"Harvested {len(rookie_state.cookies)} cookies via {rookie_state.source} from local browser.")
             self._persist_cookies(rookie_state.raw_cookies)
-            if refresh_if_needed and not rookie_state.has_valid_reese84:
+            should_refresh = (refresh_if_needed or ensure_warmup) and (not rookie_state.is_sat_valid or not rookie_state.has_valid_reese84)
+            if should_refresh and rookie_state.has_sst:
+                ok, _, refreshed_state = self.refresh_sat_token(rookie_state)
+                if ok and refreshed_state:
+                    return refreshed_state
+            elif refresh_if_needed and not rookie_state.has_valid_reese84:
                 refreshed = self.refresh_session_with_playwright(headless=True, timeout=20000, warmup_seconds=5.0)
                 if refreshed and refreshed.source != "playwright_failed":
                     return refreshed
@@ -280,14 +286,19 @@ class CDPSessionHarvester:
         cache_state = self._harvest_from_cache()
         if cache_state:
             logger.info(f"Loaded {len(cache_state.cookies)} cookies from persistent cache {self.session_path}.")
-            if refresh_if_needed and not cache_state.has_valid_reese84:
+            should_refresh = (refresh_if_needed or ensure_warmup) and (not cache_state.is_sat_valid or not cache_state.has_valid_reese84)
+            if should_refresh and cache_state.has_sst:
+                ok, _, refreshed_state = self.refresh_sat_token(cache_state)
+                if ok and refreshed_state:
+                    return refreshed_state
+            elif refresh_if_needed and not cache_state.has_valid_reese84:
                 refreshed = self.refresh_session_with_playwright(headless=True, timeout=20000, warmup_seconds=5.0)
                 if refreshed and refreshed.source != "playwright_failed":
                     return refreshed
             return cache_state
 
         # 4. Direct Playwright warm-up attempt if no prior sessions existed
-        if refresh_if_needed:
+        if refresh_if_needed or ensure_warmup:
             refreshed = self.refresh_session_with_playwright(headless=True, timeout=20000, warmup_seconds=5.0)
             if refreshed and refreshed.source != "playwright_failed":
                 return refreshed
@@ -310,6 +321,11 @@ class CDPSessionHarvester:
             f"Initiating {warmup_seconds}s Playwright session & bot token refresh on https://www.heb.com..."
         )
         existing_cookies = self._read_cache_file()
+        if not existing_cookies:
+            # Fallback to local Safari/Chrome cookies if cache is not yet populated
+            domains = ["heb.com", ".heb.com", "accounts.heb.com", "www.heb.com"]
+            existing_cookies = self._harvest_safari_cookies(domains) or self._harvest_chrome_cookies(domains)
+
         pw_cookies = []
         for c in existing_cookies:
             name = c.get("name")
@@ -319,6 +335,11 @@ class CDPSessionHarvester:
             # Skip stale reese84 to allow fresh minting
             if name == "reese84":
                 continue
+            # Strip expired sat so H-E-B server / edge issues a fresh sat from sst / accounts session cookies
+            if name == "sat":
+                is_valid, _ = check_sat_token(val)
+                if not is_valid:
+                    continue
             pw_c = {
                 "name": name,
                 "value": val,
@@ -581,11 +602,20 @@ class CDPSessionHarvester:
 
             raw_cookies: List[Dict[str, Any]] = []
             cookies_dict: Dict[str, str] = {}
-            for c in primary_cookies:
+            # Prioritize root/store domain (.heb.com, www.heb.com) over accounts.heb.com for duplicate cookie names like reese84
+            sorted_primary = sorted(
+                primary_cookies,
+                key=lambda x: 1 if "accounts.heb.com" in str(x.get("domain", "")) else 0,
+            )
+            for c in sorted_primary:
                 name = c.get("name")
                 val = c.get("value")
+                dom = c.get("domain", "")
                 if name and val:
-                    cookies_dict[name] = val
+                    if name == "reese84" and "accounts.heb.com" in str(dom) and "reese84" in cookies_dict:
+                        pass
+                    else:
+                        cookies_dict[name] = val
                     raw_cookies.append({
                         "name": name,
                         "value": val,
@@ -611,6 +641,26 @@ class CDPSessionHarvester:
 
             # Check if any cached session tokens (like sat/reese84) exist to merge
             cached_cookies = self._read_cache_file()
+            cached_map = {c["name"]: c for c in cached_cookies if c.get("name") and c.get("value")}
+
+            # Special handling for 'sat': Safari on disk is often stale when idle.
+            # If cache has a valid sat, or a sat with a newer expiration timestamp, prefer cache over Safari on-disk stale sat!
+            if "sat" in cached_map:
+                cached_sat_val = cached_map["sat"]["value"]
+                c_valid, c_exp = check_sat_token(cached_sat_val)
+                s_sat_val = cookies_dict.get("sat")
+                s_valid, s_exp = check_sat_token(s_sat_val) if s_sat_val else (False, 0.0)
+
+                if (c_valid and not s_valid) or ((c_exp or 0.0) > (s_exp or 0.0)):
+                    cookies_dict["sat"] = cached_sat_val
+                    raw_cookies = [rc for rc in raw_cookies if rc.get("name") != "sat"]
+                    raw_cookies.append(cached_map["sat"])
+
+            # Special handling for 'reese84': if browser didn't yield reese84, check cache
+            if "reese84" in cached_map and not cookies_dict.get("reese84"):
+                cookies_dict["reese84"] = cached_map["reese84"]["value"]
+                raw_cookies.append(cached_map["reese84"])
+
             for cc in cached_cookies:
                 cname = cc.get("name")
                 if cname not in cookies_dict and cc.get("value"):
@@ -741,6 +791,149 @@ class CDPSessionHarvester:
             logger.debug(f"Persisted storage state to {self.session_path}")
         except Exception as ex:
             logger.warning(f"Could not persist storage state: {ex}")
+
+    def persist_token(self, name: str, value: str, domain: str = "www.heb.com", path: str = "/", expires: Optional[float] = None):
+        """Persists or updates an individual cookie/token in cache/heb_session.json with 0600 permissions."""
+        if not name or not value:
+            return
+        try:
+            raw_cookies = self._read_cache_file()
+            updated = False
+            for c in raw_cookies:
+                if c.get("name") == name:
+                    c["value"] = value
+                    if domain:
+                        c["domain"] = domain
+                    if path:
+                        c["path"] = path
+                    if expires is not None:
+                        c["expires"] = expires
+                    updated = True
+                    break
+            if not updated:
+                raw_cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": path,
+                    "secure": True,
+                    "httpOnly": True,
+                    "expires": expires,
+                })
+            self._persist_cookies(raw_cookies)
+        except Exception as ex:
+            logger.warning(f"Could not persist token '{name}': {ex}")
+
+    def refresh_sat_token(self, current_state: Optional[SessionState] = None) -> Tuple[bool, Optional[str], Optional[SessionState]]:
+        """
+        Attempts to refresh the short-lived 'sat' token using 'sst' / 'reese84' via direct HTTP GraphQL ping.
+        Falls back to Playwright warm-up if challenged by WAF.
+        Persists the newly minted 'sat' back to cache/heb_session.json.
+        Returns (success, new_sat_token, updated_session_state).
+        """
+        state = current_state or self.harvest(refresh_if_needed=False, ensure_warmup=False)
+        if not state or not state.cookies:
+            return False, None, state
+
+        if not state.has_sst and not any(k in state.cookies for k in ["_session", "_uad"]):
+            logger.warning("Cannot refresh sat: No long-lived session cookies ('sst', '_session') present.")
+            return False, None, state
+
+        # Strategy A: Direct HTTP refresh ping to H-E-B GraphQL endpoint with cartEstimated persisted query
+        # H-E-B automatically issues a fresh 30-minute sat cookie in Set-Cookie when sst + reese84 are valid.
+        payload = {
+            "operationName": "cartEstimated",
+            "variables": {"userIsLoggedIn": True},
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "2c83f0b9d0c1dc14b4454f73f0dd692afbff44006a96471c79eba43d8d97d7fa",
+                }
+            },
+        }
+        headers = {
+            "User-Agent": state.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.heb.com",
+            "Referer": "https://www.heb.com/cart",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            from curl_cffi import requests as cffi_requests
+            resp = cffi_requests.post(
+                "https://www.heb.com/graphql",
+                json=payload,
+                headers=headers,
+                cookies=state.cookies,
+                impersonate="chrome120",
+                timeout=15,
+            )
+            new_sat = resp.cookies.get("sat")
+            if not new_sat and hasattr(resp, "headers") and "set-cookie" in resp.headers:
+                import re
+                m = re.search(r"\bsat=([^;]+)", resp.headers.get("set-cookie", ""))
+                if m:
+                    new_sat = m.group(1)
+
+            if new_sat:
+                sat_valid, sat_exp = check_sat_token(new_sat)
+                if sat_valid:
+                    logger.info(f"Direct HTTP sat refresh succeeded: fresh sat minted (exp: {sat_exp})")
+                    self.persist_token("sat", new_sat, domain="www.heb.com", expires=sat_exp)
+                    state.cookies["sat"] = new_sat
+                    state.has_sat = True
+                    state.is_sat_valid = True
+                    state.sat_expires_at = sat_exp
+                    state.is_authenticated = True
+                    return True, new_sat, state
+        except Exception as ex:
+            logger.debug(f"Direct HTTP sat refresh attempt note: {ex}")
+
+        # Strategy B: If direct HTTP failed or returned no sat (e.g. Imperva challenge or stale reese84),
+        # perform Playwright warm-up to mint a fresh reese84, then retry
+        logger.info("Direct HTTP sat refresh did not yield new token; attempting Playwright warm-up...")
+        try:
+            pw_state = self.refresh_session_with_playwright(headless=True, timeout=25000, warmup_seconds=5.0)
+            if pw_state and pw_state.is_sat_valid:
+                return True, pw_state.cookies.get("sat"), pw_state
+
+            if pw_state and pw_state.cookies and (pw_state.has_sst or "sst" in state.cookies):
+                merged_cookies = dict(state.cookies)
+                merged_cookies.update(pw_state.cookies)
+                try:
+                    from curl_cffi import requests as cffi_requests
+                    resp = cffi_requests.post(
+                        "https://www.heb.com/graphql",
+                        json=payload,
+                        headers=headers,
+                        cookies=merged_cookies,
+                        impersonate="chrome120",
+                        timeout=15,
+                    )
+                    new_sat = resp.cookies.get("sat")
+                    if not new_sat and hasattr(resp, "headers") and "set-cookie" in resp.headers:
+                        import re
+                        m = re.search(r"\bsat=([^;]+)", resp.headers.get("set-cookie", ""))
+                        if m:
+                            new_sat = m.group(1)
+                    if new_sat:
+                        sat_valid, sat_exp = check_sat_token(new_sat)
+                        if sat_valid:
+                            logger.info(f"Post-Playwright HTTP sat refresh succeeded (exp: {sat_exp})")
+                            self.persist_token("sat", new_sat, domain="www.heb.com", expires=sat_exp)
+                            state.cookies["sat"] = new_sat
+                            state.has_sat = True
+                            state.is_sat_valid = True
+                            state.sat_expires_at = sat_exp
+                            state.is_authenticated = True
+                            return True, new_sat, state
+                except Exception as ex2:
+                    logger.debug(f"Post-Playwright HTTP sat refresh note: {ex2}")
+        except Exception as pw_ex:
+            logger.warning(f"Playwright warmup exception during sat refresh: {pw_ex}")
+
+        return False, None, state
 
     def _persist_cookies(self, cookies: List[Dict[str, Any]]):
         """Persists cookies securely with 0600 permissions, preserving origins/localStorage if present."""

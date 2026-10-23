@@ -1,7 +1,7 @@
 """
 tests/test_core_modules.py
 
-Unit test suite for TikTok-2-HEB core modules:
+Unit test suite for heb-mcp.skill (TikTok-2-HEB) core modules:
 - extract_recipe_media: Subtitle parsing & culinary token analysis
 - cache_manager: Pydantic models, PantryComparator, HouseholdScaler, CacheManager CRUD
 - heb_client: Catalog search, 4-tier OOS cascade engine
