@@ -22,7 +22,7 @@ Activate this skill whenever:
 
 ## 🚀 First-Time Setup (Agent-Driven Onboarding)
 
-When a user asks you to set up this project, handle the technical steps for them and only ask brief, plain-English questions:
+When a user asks you to set up this project, handle the technical steps for them and only ask brief, plain-language questions:
 1. **Install environment & binaries:**
    ```bash
    uv venv --python 3.11 .venv && source .venv/bin/activate && uv pip install -r requirements.txt
